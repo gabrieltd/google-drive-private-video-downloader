@@ -11,9 +11,13 @@ test("sanitizeFilename creates safe bounded MP4 names", () => {
     assert.equal(sanitizeFilename("video.mp4"), "video.mp4");
     assert.equal(sanitizeFilename("my:video?.mp4"), "my-video-.mp4");
     assert.equal(sanitizeFilename("CON"), "CON-.mp4");
+    assert.equal(sanitizeFilename("CON.mp4"), "CON-.mp4");
     assert.equal(sanitizeFilename("video."), "video.mp4");
     assert.equal(sanitizeFilename("video     "), "video.mp4");
     assert.ok(sanitizeFilename("x".repeat(500)).length <= 180);
+    const longMp4 = sanitizeFilename(`${"x".repeat(500)}.mp4`);
+    assert.ok(longMp4.length <= 180);
+    assert.equal(longMp4.endsWith(".mp4"), true);
 });
 
 test("selectBestProgressiveFormat prefers resolution, then width and fps", () => {

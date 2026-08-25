@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { parseDriveVideoResponse } from "../lib/drive-parser.js";
+import { selectBestProgressiveFormat } from "../lib/video-model.js";
 
 const progressive = (itag, height) => ({
     itag,
@@ -40,6 +41,51 @@ test("recognizes adaptive formats but marks them as non-progressive", () => {
     });
     assert.equal(result.title, "Untitled video");
     assert.equal(result.formats[0].progressive, false);
+});
+
+test("parses realistic transcodeMetadata fields and selects the best quality", () => {
+    const result = parseDriveVideoResponse({
+        mediaMetadata: { title: "Test video", videoId: "drive-video-id" },
+        mediaStreamingData: {
+            formatStreamingData: {
+                progressiveTranscodes: [
+                    {
+                        itag: 22,
+                        url: "https://example.test/video/22?token=fake",
+                        transcodeMetadata: {
+                            width: 1280,
+                            height: 720,
+                            videoFps: 30,
+                            contentLength: "100000000",
+                            mimeType: "video/mp4",
+                            videoCodecString: "avc1.test",
+                            audioCodecString: "mp4a.test",
+                        },
+                    },
+                    {
+                        itag: 37,
+                        url: "https://example.test/video/37?token=fake",
+                        transcodeMetadata: {
+                            width: 1920,
+                            height: 1080,
+                            videoFps: 30,
+                            contentLength: "200000000",
+                            mimeType: "video/mp4",
+                        },
+                    },
+                ],
+            },
+        },
+    });
+
+    assert.equal(result.formats.length, 2);
+    assert.equal(result.formats[0].height, 720);
+    assert.equal(result.formats[0].fps, 30);
+    assert.equal(result.formats[0].contentLength, 100000000);
+    assert.equal(result.formats[0].videoCodec, "avc1.test");
+    assert.equal(result.formats[0].audioCodec, "mp4a.test");
+    assert.equal(result.formats[1].height, 1080);
+    assert.equal(selectBestProgressiveFormat(result.formats).height, 1080);
 });
 
 test("returns null for unexpected, incomplete or non-video responses", () => {

@@ -126,6 +126,35 @@ function userFacingDownloadError(error) {
     return `Download failed. ${error?.message ?? "The captured download URL may have expired. Reload the Drive video and try again."}`;
 }
 
+function normalizeDownloadState(state) {
+    return state === "in_progress" ? "downloading" : state;
+}
+
+function formatDownloadChangeError(errorCode) {
+    return `Download failed (${errorCode}). The captured download URL may have expired. Reload the Drive video and try again.`;
+}
+
+async function runWithConcurrency(tasks, concurrency = 3) {
+    const results = new Array(tasks.length);
+    let nextIndex = 0;
+    const workerCount = Math.min(Math.max(1, concurrency), tasks.length);
+
+    async function worker() {
+        while (nextIndex < tasks.length) {
+            const index = nextIndex;
+            nextIndex += 1;
+            try {
+                results[index] = await tasks[index]();
+            } catch (error) {
+                results[index] = { success: false, error: error.message };
+            }
+        }
+    }
+
+    await Promise.all(Array.from({ length: workerCount }, () => worker()));
+    return results;
+}
+
 function attachDebugger(tabId) {
     return chromeCall(chrome.debugger.attach.bind(chrome.debugger), { tabId }, "1.3").catch((error) => {
         if (/already attached|debugger is already attached/i.test(error.message)) return undefined;
@@ -332,7 +361,6 @@ async function startDownload(tabId, videoId, formatId = null, formatKey = null) 
         error: null,
         formatId: format.itag,
         totalBytes: format.contentLength,
-        bytesReceived: 0,
     });
     if (downloadingVideo) {
         await tabState.persist();
@@ -346,10 +374,8 @@ async function handleDownloadChange(downloadId, delta) {
     if (!association) return;
 
     const changes = {};
-    if (delta.state?.current) changes.status = delta.state.current;
-    if (delta.error?.current) changes.error = delta.error.current;
-    if (delta.bytesReceived?.current !== undefined) changes.bytesReceived = delta.bytesReceived.current;
-    if (delta.totalBytes?.current !== undefined) changes.totalBytes = delta.totalBytes.current;
+    if (delta.state?.current) changes.status = normalizeDownloadState(delta.state.current);
+    if (delta.error?.current) changes.error = formatDownloadChangeError(delta.error.current);
     if (Object.keys(changes).length === 0) return;
 
     const video = tabState.updateDownload(association.tabId, association.videoId, changes);
@@ -406,10 +432,13 @@ async function handleMessage(message, sender) {
     if (message.type === MESSAGE_TYPES.DOWNLOAD_ALL) {
         if (!Number.isInteger(tabId)) return { success: false, error: "No active tab." };
         const videos = tabState.getVideosForTab(tabId);
-        const results = await Promise.all(videos.map((video) => {
-            if (video.download?.status === "downloading") return Promise.resolve({ success: true, skipped: true });
-            return startDownload(tabId, video.id);
-        }));
+        const tasks = videos.map((video) => async () => {
+            if (video.download?.status === "downloading") {
+                return { videoId: video.id, success: true, skipped: true };
+            }
+            return { videoId: video.id, ...(await startDownload(tabId, video.id)) };
+        });
+        const results = await runWithConcurrency(tasks, 3);
         return { success: results.some((result) => result.success), results };
     }
 

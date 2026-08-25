@@ -1,5 +1,5 @@
 import { MESSAGE_TYPES } from "../lib/messages.js";
-import { formatBytes, formatIdentity } from "../lib/video-model.js";
+import { formatBytes, formatIdentity, selectBestProgressiveFormat } from "../lib/video-model.js";
 import { isGoogleDriveUrl } from "../lib/url-utils.js";
 
 document.addEventListener("DOMContentLoaded", () => {
@@ -50,6 +50,14 @@ document.addEventListener("DOMContentLoaded", () => {
         return `${resolution}${fps}${size}`;
     }
 
+    function compareFormatQuality(left, right) {
+        for (const field of ["height", "width", "fps", "bitrate", "contentLength"]) {
+            const difference = (right[field] ?? -1) - (left[field] ?? -1);
+            if (difference !== 0) return difference;
+        }
+        return 0;
+    }
+
     function renderVideo(video) {
         const item = document.createElement("div");
         item.className = "video-item";
@@ -63,23 +71,31 @@ document.addEventListener("DOMContentLoaded", () => {
         title.textContent = video.title;
         info.appendChild(title);
 
-        const progressiveFormats = (video.formats ?? []).filter((format) => format.progressive === true);
+        const progressiveFormats = (video.formats ?? [])
+            .filter((format) => format.progressive === true)
+            .sort(compareFormatQuality);
         const controls = document.createElement("div");
         controls.className = "video-controls";
-        let selectedFormat = progressiveFormats[0] ?? null;
+        let selectedFormat = selectBestProgressiveFormat(progressiveFormats);
 
         if (progressiveFormats.length > 0) {
             const selector = document.createElement("select");
             selector.className = "quality-selector";
+            const bestOption = document.createElement("option");
+            bestOption.value = "best";
+            bestOption.textContent = `Best — ${qualityLabel(selectedFormat)}`;
+            selector.appendChild(bestOption);
+
             for (const format of progressiveFormats) {
                 const option = document.createElement("option");
                 option.value = formatIdentity(format);
                 option.textContent = qualityLabel(format);
                 selector.appendChild(option);
             }
-            selectedFormat = progressiveFormats[0];
             selector.addEventListener("change", () => {
-                selectedFormat = progressiveFormats.find((format) => formatIdentity(format) === selector.value) ?? null;
+                selectedFormat = selector.value === "best"
+                    ? selectBestProgressiveFormat(progressiveFormats)
+                    : progressiveFormats.find((format) => formatIdentity(format) === selector.value) ?? null;
             });
             controls.appendChild(selector);
         }
@@ -133,8 +149,11 @@ document.addEventListener("DOMContentLoaded", () => {
         updateButtons(state);
         downloadContainer.replaceChildren();
 
+        const downloadError = videos.find((video) => video.download?.error)?.download?.error;
         if (state?.lastError) {
             setStatus(state.lastError, true);
+        } else if (downloadError) {
+            setStatus(downloadError, true);
         } else if (!state?.enabled) {
             setStatus("Click ON to start capture.");
         } else if (videos.length === 0) {

@@ -65,3 +65,64 @@ test("deduplicates the same video while merging newly discovered formats", () =>
     assert.equal(manager.getVideosForTab(7).length, 1);
     assert.equal(manager.getVideosForTab(7)[0].formats.length, 2);
 });
+
+test("new detections replace stale signed URLs for the same format", () => {
+    const manager = createTabStateManager();
+    manager.enableTab(8);
+    const base = {
+        id: "video-refresh",
+        tabId: 8,
+        title: "Refresh video",
+        capturedAt: 1,
+        sourceMetadata: { videoId: "refresh-id" },
+        identityKey: "source:refresh-id",
+        download: null,
+    };
+
+    manager.addOrUpdateVideo(8, {
+        ...base,
+        formats: [{ itag: 37, url: "https://example.test/video?token=old", progressive: true }],
+    });
+    manager.addOrUpdateVideo(8, {
+        ...base,
+        formats: [{ itag: 37, url: "https://example.test/video?token=new", progressive: true }],
+    });
+
+    const videos = manager.getVideosForTab(8);
+    assert.equal(videos.length, 1);
+    assert.equal(videos[0].formats.length, 1);
+    assert.equal(videos[0].formats[0].url, "https://example.test/video?token=new");
+});
+
+test("download associations survive persist and service-worker hydration", async () => {
+    let stored = {};
+    const storage = {
+        async get(key) { return { [key]: stored[key] }; },
+        async set(value) { stored = { ...stored, ...value }; },
+    };
+    const manager = createTabStateManager({ storage });
+    manager.enableTab(9);
+    manager.addOrUpdateVideo(9, {
+        id: "video-download-recovery",
+        tabId: 9,
+        title: "Download recovery",
+        capturedAt: 1,
+        formats: [{ itag: 22, url: "https://example.test/video", progressive: true }],
+        sourceMetadata: { videoId: "download-recovery" },
+        identityKey: "source:download-recovery",
+        download: null,
+    });
+    manager.updateDownload(9, "video-download-recovery", {
+        downloadId: 321,
+        status: "downloading",
+    });
+    await manager.persist();
+
+    const restored = createTabStateManager({ storage });
+    await restored.hydrate();
+    assert.deepEqual(restored.findVideoByDownloadId(321), {
+        tabId: 9,
+        videoId: "video-download-recovery",
+        video: restored.getVideosForTab(9)[0],
+    });
+});
