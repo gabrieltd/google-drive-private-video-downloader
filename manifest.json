@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Google Drive - Private Video Downloader",
-  "version": "1.0",
-  "description": "Download Google Drive privatly shared videos.",
+  "version": "1.1.0",
+  "description": "Download video streams already delivered to your authenticated Google Drive session.",
   "icons": {
     "16": "assets/icon.png",
     "32": "assets/icon.png",
@@ -15,17 +15,17 @@
   "permissions": [
     "debugger",
     "activeTab",
+    "tabs",
     "downloads",
     "storage"
-  ],
-  "host_permissions": [
-    "<all_urls>"
   ],
   "action": {
     "default_popup": "popup/popup.html",
     "default_icon": "assets/icon.png"
   },
   "background": {
-    "service_worker": "background/background.js"
-  }
+    "service_worker": "background/background.js",
+    "type": "module"
+  },
+  "minimum_chrome_version": "102"
 }

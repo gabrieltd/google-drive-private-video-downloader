@@ -1,3 +1,7 @@
+import { MESSAGE_TYPES } from "../lib/messages.js";
+import { formatBytes, formatIdentity } from "../lib/video-model.js";
+import { isGoogleDriveUrl } from "../lib/url-utils.js";
+
 document.addEventListener("DOMContentLoaded", () => {
     const header = document.querySelector(".header");
     const notDriveMessage = document.getElementById("only-in-drive-message");
@@ -6,145 +10,230 @@ document.addEventListener("DOMContentLoaded", () => {
     const btnOn = document.getElementById("button-on");
     const btnOff = document.getElementById("button-off");
     const reloadBtn = document.querySelector(".reload-button");
+    const downloadAllBtn = document.getElementById("download-all");
 
-    function updateUI(isEnabled) {
-        btnOn.disabled = isEnabled;
-        btnOff.disabled = !isEnabled;
-        reloadBtn.classList.toggle("active", isEnabled);
-    }
+    let activeTabId = null;
+    let currentState = null;
+    let currentVideos = [];
 
-    function handleStateChange(newState) {
-        chrome.storage.local.set({ extensionEnabled: newState }, () => {
-            updateUI(newState);
-
-            if (!newState) {
-                downloadContainer.innerHTML = "";
-                statusMessage.textContent = "Extension stopped.";
-                setTimeout(() => {
-                    statusMessage.textContent = "Click ON to start extension.";
-                }, 2000);
-            }
-
-            chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
-                const tab = tabs[0];
-                if (!tab) return;
-
-                chrome.runtime.sendMessage(
-                    {
-                        type: "setEnabled",
-                        enabled: newState,
-                        tabId: tab.id,
-                        url: tab.url,
-                    },
-                    (response) => {
-                        if (newState && response?.success) {
-                            chrome.tabs.reload(tab.id);
-                        }
-                    }
-                );
+    function sendMessage(message) {
+        return new Promise((resolve, reject) => {
+            chrome.runtime.sendMessage(message, (response) => {
+                const lastError = chrome.runtime.lastError;
+                if (lastError) {
+                    reject(new Error(lastError.message));
+                    return;
+                }
+                resolve(response);
             });
         });
     }
 
-    INVALID_FILENAME_CHARACTERS_REGEX = /([<>:"\/\\|?*])+/g;
-    FILENAME_EXTENSION_REGEX = /^.*\.[a-zA-Z0-9]+$/;
-
-    function filenameCleanAndNormalize(filename) {
-        const cleaned = filename.replaceAll(INVALID_FILENAME_CHARACTERS_REGEX, "-");
-        return cleaned.match(FILENAME_EXTENSION_REGEX) ? cleaned : cleaned + ".mp4";
+    function setStatus(message, isError = false) {
+        statusMessage.textContent = message;
+        statusMessage.classList.toggle("error", isError);
     }
+
+    function updateButtons(state) {
+        const enabled = state?.enabled === true;
+        const hasError = Boolean(state?.lastError);
+        btnOn.disabled = enabled && !hasError;
+        btnOn.textContent = enabled && hasError ? "RETRY" : "ON";
+        btnOff.disabled = !enabled;
+        reloadBtn.classList.toggle("active", enabled);
+    }
+
+    function qualityLabel(format) {
+        const resolution = format.height ? `${format.height}p` : "Unknown quality";
+        const fps = format.fps ? ` · ${format.fps} fps` : "";
+        const size = format.contentLength ? ` · ${formatBytes(format.contentLength)}` : "";
+        return `${resolution}${fps}${size}`;
+    }
+
+    function renderVideo(video) {
+        const item = document.createElement("div");
+        item.className = "video-item";
+
+        const info = document.createElement("div");
+        info.className = "video-info";
+
+        const title = document.createElement("span");
+        title.className = "video-title";
+        title.title = video.title;
+        title.textContent = video.title;
+        info.appendChild(title);
+
+        const progressiveFormats = (video.formats ?? []).filter((format) => format.progressive === true);
+        const controls = document.createElement("div");
+        controls.className = "video-controls";
+        let selectedFormat = progressiveFormats[0] ?? null;
+
+        if (progressiveFormats.length > 0) {
+            const selector = document.createElement("select");
+            selector.className = "quality-selector";
+            for (const format of progressiveFormats) {
+                const option = document.createElement("option");
+                option.value = formatIdentity(format);
+                option.textContent = qualityLabel(format);
+                selector.appendChild(option);
+            }
+            selectedFormat = progressiveFormats[0];
+            selector.addEventListener("change", () => {
+                selectedFormat = progressiveFormats.find((format) => formatIdentity(format) === selector.value) ?? null;
+            });
+            controls.appendChild(selector);
+        }
+
+        const downloadButton = document.createElement("button");
+        downloadButton.className = "download-button";
+        const downloadStatus = video.download?.status;
+        if (downloadStatus === "downloading") {
+            downloadButton.textContent = "Downloading…";
+            downloadButton.disabled = true;
+        } else if (downloadStatus === "complete") {
+            downloadButton.textContent = "Download again";
+        } else if (downloadStatus === "interrupted") {
+            downloadButton.textContent = "Retry";
+        } else {
+            downloadButton.textContent = "Download";
+        }
+
+        if (!selectedFormat) {
+            downloadButton.disabled = true;
+            const adaptiveNote = document.createElement("span");
+            adaptiveNote.className = "format-note";
+            adaptiveNote.textContent = "No direct progressive stream";
+            controls.appendChild(adaptiveNote);
+        } else {
+            downloadButton.addEventListener("click", async () => {
+                downloadButton.disabled = true;
+                setStatus("Starting download…");
+                try {
+                    const response = await sendMessage({
+                        type: MESSAGE_TYPES.DOWNLOAD_VIDEO,
+                        tabId: activeTabId,
+                        videoId: video.id,
+                        formatKey: formatIdentity(selectedFormat),
+                    });
+                    if (!response?.success) setStatus(response?.error ?? "Download failed.", true);
+                } catch (error) {
+                    setStatus(error.message, true);
+                }
+            });
+        }
+        controls.appendChild(downloadButton);
+
+        item.append(info, controls);
+        return item;
+    }
+
+    function render(state, videos) {
+        currentState = state;
+        currentVideos = videos;
+        updateButtons(state);
+        downloadContainer.replaceChildren();
+
+        if (state?.lastError) {
+            setStatus(state.lastError, true);
+        } else if (!state?.enabled) {
+            setStatus("Click ON to start capture.");
+        } else if (videos.length === 0) {
+            setStatus("Waiting for a Google Drive video… Open or play a video preview to detect available streams.");
+        } else {
+            setStatus(state.debuggerAttached ? "Capturing" : "Capture is paused.");
+        }
+
+        const hasDownloadableVideo = videos.some((video) => (video.formats ?? []).some((format) => format.progressive));
+        downloadAllBtn.classList.toggle("hidden", !hasDownloadableVideo);
+        for (const video of videos) downloadContainer.appendChild(renderVideo(video));
+    }
+
+    function showDriveUi(isDrive) {
+        header.classList.toggle("hidden", !isDrive);
+        downloadContainer.classList.toggle("hidden", !isDrive);
+        statusMessage.classList.toggle("hidden", !isDrive);
+        notDriveMessage.classList.toggle("hidden", isDrive);
+        downloadAllBtn.classList.toggle("hidden", !isDrive);
+    }
+
+    async function refreshState() {
+        if (activeTabId === null) return;
+        try {
+            const response = await sendMessage({ type: MESSAGE_TYPES.GET_TAB_STATE, tabId: activeTabId });
+            if (!response?.success) throw new Error(response?.error ?? "Unable to read tab state.");
+            render(response.state, response.videos ?? []);
+        } catch (error) {
+            setStatus(error.message, true);
+        }
+    }
+
+    async function setEnabled(enabled) {
+        btnOn.disabled = true;
+        btnOff.disabled = true;
+        setStatus(enabled ? "Starting capture…" : "Stopping capture…");
+        try {
+            const response = await sendMessage({
+                type: MESSAGE_TYPES.SET_TAB_ENABLED,
+                tabId: activeTabId,
+                enabled,
+                reload: enabled,
+            });
+            if (!response?.success) {
+                render(response?.state ?? currentState, response?.videos ?? currentVideos);
+                setStatus(response?.error ?? "Unable to change capture state.", true);
+                return;
+            }
+            render(response.state, response.videos ?? []);
+        } catch (error) {
+            setStatus(error.message, true);
+        }
+    }
+
+    btnOn.addEventListener("click", () => void setEnabled(true));
+    btnOff.addEventListener("click", () => void setEnabled(false));
+    reloadBtn.addEventListener("click", () => {
+        if (activeTabId !== null) chrome.tabs.reload(activeTabId);
+    });
+    downloadAllBtn.addEventListener("click", async () => {
+        downloadAllBtn.disabled = true;
+        try {
+            const response = await sendMessage({ type: MESSAGE_TYPES.DOWNLOAD_ALL, tabId: activeTabId });
+            if (!response?.success) setStatus("No video could be queued for download.", true);
+        } catch (error) {
+            setStatus(error.message, true);
+        } finally {
+            downloadAllBtn.disabled = false;
+        }
+    });
+
+    chrome.runtime.onMessage.addListener((message) => {
+        if (!message || message.tabId !== activeTabId) return;
+        if (message.type === MESSAGE_TYPES.VIDEO_DETECTED || message.type === MESSAGE_TYPES.VIDEO_UPDATED) {
+            const index = currentVideos.findIndex((video) => video.id === message.video?.id);
+            if (index === -1) currentVideos = [...currentVideos, message.video];
+            else currentVideos = currentVideos.map((video, videoIndex) => videoIndex === index ? message.video : video);
+            render(currentState, currentVideos);
+        } else if (message.type === MESSAGE_TYPES.DOWNLOAD_UPDATED) {
+            currentVideos = currentVideos.map((video) => video.id === message.videoId
+                ? { ...video, download: message.download }
+                : video);
+            render(currentState, currentVideos);
+        } else if (message.type === MESSAGE_TYPES.TAB_STATE_CHANGED) {
+            currentState = message.state;
+            if (!currentState.enabled) currentVideos = [];
+            render(currentState, currentVideos);
+        }
+    });
 
     chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
         const tab = tabs[0];
-        if (!tab || !tab.url.startsWith("https://drive.google.com/")) {
-            header.classList.add("hidden");
-            downloadContainer.classList.add("hidden");
-            statusMessage.classList.add("hidden");
-            notDriveMessage.classList.remove("hidden");
+        const isDrive = Boolean(tab && isGoogleDriveUrl(tab.url));
+        showDriveUi(isDrive);
+        if (!isDrive) {
+            setStatus("Open a Google Drive video or preview to use this extension.");
             return;
         }
-
-        header.classList.remove("hidden");
-        downloadContainer.classList.remove("hidden");
-        statusMessage.classList.remove("hidden");
-        notDriveMessage.classList.add("hidden");
-
-        chrome.storage.local.get(["extensionEnabled"], (result) => {
-            const isEnabled = result.extensionEnabled !== undefined ? result.extensionEnabled : false;
-            updateUI(isEnabled);
-        });
-
-        btnOn.addEventListener("click", () => handleStateChange(true));
-        btnOff.addEventListener("click", () => handleStateChange(false));
-
-        reloadBtn.addEventListener("click", () => {
-            chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
-                if (tabs[0]?.id) {
-                    chrome.tabs.reload(tabs[0].id);
-                }
-            });
-        });
-
-        const activeTabId = tab.id;
-
-        function checkRequests() {
-            chrome.runtime.sendMessage({ type: "getRequests" }, (response) => {
-                if (response && response.requests) {
-                    const matchingRequests = [];
-                    for (const requestId in response.requests) {
-                        const req = response.requests[requestId];
-                        if (req.tabId === activeTabId && req.lastItagUrl && req.videoTitle) {
-                            matchingRequests.push(req);
-                        }
-                    }
-                    if (matchingRequests.length > 0) {
-                        statusMessage.textContent = "";
-                        downloadContainer.innerHTML = "";
-                        matchingRequests.forEach((req) => {
-                            const item = document.createElement("div");
-                            item.classList.add("video-item");
-
-                            const titleSpan = document.createElement("span");
-                            titleSpan.classList.add("video-title");
-                            titleSpan.title = req.videoTitle;
-                            titleSpan.textContent = req.videoTitle;
-
-                            const button = document.createElement("button");
-                            button.classList.add("download-button");
-                            button.innerHTML =
-                                '<svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-download-icon lucide-download"><path d="M12 15V3"/><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m7 10 5 5 5-5"/></svg>';
-                            button.addEventListener("click", () => {
-                                chrome.downloads.download(
-                                    {
-                                        url: req.lastItagUrl,
-                                        filename: filenameCleanAndNormalize(req.videoTitle),
-                                        conflictAction: "uniquify",
-                                    },
-                                    () => {
-                                        if (chrome.runtime.lastError) {
-                                            statusMessage.textContent = `Error: ${chrome.runtime.lastError.message}`;
-                                            statusMessage.classList.add("error");
-                                        }
-                                    }
-                                );
-                            });
-
-                            item.appendChild(titleSpan);
-                            item.appendChild(button);
-                            downloadContainer.appendChild(item);
-                        });
-                    } else {
-                        chrome.storage.local.get(["extensionEnabled"], (result) => {
-                            if (result.extensionEnabled) {
-                                statusMessage.textContent =
-                                    "Waiting for new video source. If not working reload the page.";
-                            }
-                        });
-                    }
-                }
-            });
-        }
-
-        setInterval(() => checkRequests(), 1500);
+        activeTabId = tab.id;
+        void refreshState();
     });
 });
