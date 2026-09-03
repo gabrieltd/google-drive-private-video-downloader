@@ -1,6 +1,7 @@
 import { MESSAGE_TYPES } from "../lib/messages.js";
+import { FOLDER_SCAN_STATUSES } from "../lib/folder-scan.js";
 import { formatBytes, formatIdentity, selectBestProgressiveFormat } from "../lib/video-model.js";
-import { isGoogleDriveUrl } from "../lib/url-utils.js";
+import { isGoogleDriveFolderUrl, isGoogleDriveUrl } from "../lib/url-utils.js";
 
 document.addEventListener("DOMContentLoaded", () => {
     const header = document.querySelector(".header");
@@ -16,11 +17,19 @@ document.addEventListener("DOMContentLoaded", () => {
     const collectionActions = document.getElementById("collection-actions");
     const clearListButton = document.getElementById("clear-list");
     const downloadSelectedButton = document.getElementById("download-selected");
+    const folderSection = document.getElementById("folder-section");
+    const scanFolderButton = document.getElementById("scan-folder");
+    const folderScanProgress = document.getElementById("folder-scan-progress");
+    const folderScanMessageElement = document.getElementById("folder-scan-message");
+    const cancelFolderScanButton = document.getElementById("cancel-folder-scan");
+    const retryFolderScanButton = document.getElementById("retry-folder-scan");
+    const folderScanHint = document.getElementById("folder-scan-hint");
 
     let activeTabId = null;
     let currentState = null;
     let currentVideos = [];
     let selectedVideoIds = new Set();
+    let currentTabUrl = "";
 
     function sendMessage(message) {
         return new Promise((resolve, reject) => {
@@ -43,10 +52,16 @@ document.addEventListener("DOMContentLoaded", () => {
     function updateButtons(state) {
         const enabled = state?.enabled === true;
         const hasError = Boolean(state?.lastError);
-        btnOn.disabled = enabled && !hasError;
+        const scanActive = [
+            FOLDER_SCAN_STATUSES.DISCOVERING,
+            FOLDER_SCAN_STATUSES.COLLECTING,
+            FOLDER_SCAN_STATUSES.PAUSED,
+        ].includes(state?.folderScan?.status);
+        btnOn.disabled = scanActive || enabled && !hasError;
         btnOn.textContent = enabled && hasError ? "RETRY" : "ON";
-        btnOff.disabled = !enabled;
+        btnOff.disabled = scanActive || !enabled;
         reloadBtn.classList.toggle("active", enabled);
+        reloadBtn.disabled = scanActive;
     }
 
     function qualityLabel(format) {
@@ -78,8 +93,57 @@ document.addEventListener("DOMContentLoaded", () => {
         selectionCount.textContent = `${selected} of ${total} selected`;
         downloadSelectedButton.textContent = `Download selected (${selected})`;
         downloadSelectedButton.disabled = selected === 0;
-        clearListButton.disabled = total === 0;
+        const scanActive = [
+            FOLDER_SCAN_STATUSES.DISCOVERING,
+            FOLDER_SCAN_STATUSES.COLLECTING,
+            FOLDER_SCAN_STATUSES.PAUSED,
+        ].includes(currentState?.folderScan?.status);
+        clearListButton.disabled = total === 0 || scanActive;
         selectionToolbar.classList.toggle("hidden", total === 0);
+    }
+
+    function getFolderScanMessage(scan) {
+        if (!scan) return "";
+        const adaptiveFailureCount = (scan.candidates ?? [])
+            .filter((candidate) => candidate.error?.includes("separate video and audio streams")).length;
+        const failureSummary = scan.failedCount
+            ? ` ${scan.failedCount} failed${adaptiveFailureCount ? ` (${adaptiveFailureCount} require adaptive muxing)` : ""}`
+            : "";
+        if (scan.status === FOLDER_SCAN_STATUSES.DISCOVERING) {
+            return `Scanning folder… ${scan.discoveredCount} video candidate${scan.discoveredCount === 1 ? "" : "s"} discovered`;
+        }
+        if (scan.status === FOLDER_SCAN_STATUSES.COLLECTING) {
+            return `Collecting ${scan.capturedCount} of ${scan.total} videos…${failureSummary}`;
+        }
+        if (scan.status === FOLDER_SCAN_STATUSES.PAUSED) return "Folder scan paused. Return to this Drive tab to continue.";
+        if (scan.status === FOLDER_SCAN_STATUSES.COMPLETED) {
+            return scan.total === 0
+                ? "No video files were found in this folder."
+                : `Folder scan complete: ${scan.capturedCount} of ${scan.total} captured${failureSummary ? `,${failureSummary}` : ""}.`;
+        }
+        if (scan.status === FOLDER_SCAN_STATUSES.CANCELLED) return "Folder scan cancelled.";
+        if (scan.status === FOLDER_SCAN_STATUSES.ERROR) return scan.error ?? "Unable to inspect this Drive folder.";
+        return "";
+    }
+
+    function renderFolderScan(state, isFolder) {
+        const scan = state?.folderScan;
+        const active = [
+            FOLDER_SCAN_STATUSES.DISCOVERING,
+            FOLDER_SCAN_STATUSES.COLLECTING,
+            FOLDER_SCAN_STATUSES.PAUSED,
+        ].includes(scan?.status);
+        const hasResult = scan?.status && scan.status !== FOLDER_SCAN_STATUSES.IDLE;
+        scanFolderButton.disabled = !isFolder || active;
+        folderScanProgress.classList.toggle("hidden", !hasResult);
+        folderScanMessageElement.textContent = getFolderScanMessage(scan);
+        cancelFolderScanButton.classList.toggle("hidden", !active);
+        cancelFolderScanButton.disabled = !active;
+        retryFolderScanButton.classList.toggle("hidden", active || !scan?.failedCount);
+        retryFolderScanButton.disabled = active || !scan?.failedCount;
+        folderScanHint.textContent = isFolder
+            ? active ? "" : "Only videos directly inside this folder are scanned; subfolders are skipped."
+            : "Open a Drive folder to scan its videos.";
     }
 
     async function persistSelection(nextSelection) {
@@ -207,11 +271,22 @@ document.addEventListener("DOMContentLoaded", () => {
         currentVideos = videos;
         selectedVideoIds = selectionForVideos(state, videos);
         updateButtons(state);
+        renderFolderScan(state, isGoogleDriveFolderUrl(currentTabUrl));
         downloadContainer.replaceChildren();
 
         const downloadError = videos.find((video) => video.download?.error)?.download?.error;
+        const scanStatus = state?.folderScan?.status;
         if (state?.lastError) {
             setStatus(state.lastError, true);
+        } else if ([
+            FOLDER_SCAN_STATUSES.DISCOVERING,
+            FOLDER_SCAN_STATUSES.COLLECTING,
+            FOLDER_SCAN_STATUSES.PAUSED,
+            FOLDER_SCAN_STATUSES.COMPLETED,
+            FOLDER_SCAN_STATUSES.CANCELLED,
+            FOLDER_SCAN_STATUSES.ERROR,
+        ].includes(scanStatus)) {
+            setStatus(getFolderScanMessage(state.folderScan), scanStatus === FOLDER_SCAN_STATUSES.ERROR);
         } else if (downloadError) {
             setStatus(downloadError, true);
         } else if (!state?.enabled) {
@@ -235,6 +310,8 @@ document.addEventListener("DOMContentLoaded", () => {
         notDriveMessage.classList.toggle("hidden", isDrive);
         collectionActions.classList.toggle("hidden", !isDrive);
         selectionToolbar.classList.toggle("hidden", !isDrive || currentVideos.length === 0);
+        folderSection.classList.toggle("hidden", !isDrive);
+        renderFolderScan(currentState, isDrive && isGoogleDriveFolderUrl(currentTabUrl));
     }
 
     async function refreshState() {
@@ -272,6 +349,41 @@ document.addEventListener("DOMContentLoaded", () => {
 
     btnOn.addEventListener("click", () => void setEnabled(true));
     btnOff.addEventListener("click", () => void setEnabled(false));
+    scanFolderButton.addEventListener("click", async () => {
+        scanFolderButton.disabled = true;
+        setStatus("Starting folder scan…");
+        try {
+            const response = await sendMessage({ type: MESSAGE_TYPES.START_FOLDER_SCAN, tabId: activeTabId });
+            if (!response?.success) {
+                render(response?.state ?? currentState, response?.videos ?? currentVideos);
+                setStatus(response?.error ?? "Unable to start the folder scan.", true);
+                return;
+            }
+            render(response.state, response.videos ?? currentVideos);
+        } catch (error) {
+            setStatus(error.message, true);
+        }
+    });
+    cancelFolderScanButton.addEventListener("click", async () => {
+        cancelFolderScanButton.disabled = true;
+        try {
+            const response = await sendMessage({ type: MESSAGE_TYPES.CANCEL_FOLDER_SCAN, tabId: activeTabId });
+            if (!response?.success) setStatus(response?.error ?? "Unable to cancel the folder scan.", true);
+            else render(response.state, response.videos ?? currentVideos);
+        } catch (error) {
+            setStatus(error.message, true);
+        }
+    });
+    retryFolderScanButton.addEventListener("click", async () => {
+        retryFolderScanButton.disabled = true;
+        try {
+            const response = await sendMessage({ type: MESSAGE_TYPES.RETRY_FAILED_FOLDER_SCAN, tabId: activeTabId });
+            if (!response?.success) setStatus(response?.error ?? "Unable to retry failed videos.", true);
+            else render(response.state, response.videos ?? currentVideos);
+        } catch (error) {
+            setStatus(error.message, true);
+        }
+    });
     reloadBtn.addEventListener("click", () => {
         if (activeTabId !== null) chrome.tabs.reload(activeTabId);
     });
@@ -321,7 +433,7 @@ document.addEventListener("DOMContentLoaded", () => {
                 ? { ...video, download: message.download }
                 : video);
             render(currentState, currentVideos);
-        } else if (message.type === MESSAGE_TYPES.TAB_STATE_CHANGED) {
+        } else if (message.type === MESSAGE_TYPES.TAB_STATE_CHANGED || message.type === MESSAGE_TYPES.FOLDER_SCAN_UPDATED) {
             currentState = message.state;
             currentVideos = message.state?.videos ?? currentVideos;
             render(currentState, currentVideos);
@@ -331,6 +443,7 @@ document.addEventListener("DOMContentLoaded", () => {
     chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
         const tab = tabs[0];
         const isDrive = Boolean(tab && isGoogleDriveUrl(tab.url));
+        currentTabUrl = tab?.url ?? "";
         showDriveUi(isDrive);
         if (!isDrive) {
             setStatus("Open a Google Drive video or preview to use this extension.");

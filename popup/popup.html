@@ -38,6 +38,16 @@
         <div class="download-toolbar">
             <div id="status-message" class="hidden" role="status"></div>
         </div>
+        <section id="folder-section" class="folder-section hidden" aria-labelledby="folder-heading">
+            <h3 id="folder-heading">FOLDER</h3>
+            <button id="scan-folder" class="secondary-button">Scan current folder</button>
+            <div id="folder-scan-progress" class="folder-scan-progress hidden">
+                <span id="folder-scan-message"></span>
+                <button id="cancel-folder-scan" class="secondary-button">Cancel</button>
+                <button id="retry-folder-scan" class="secondary-button hidden">Retry failed</button>
+            </div>
+            <p id="folder-scan-hint" class="folder-scan-hint"></p>
+        </section>
         <div id="selection-toolbar" class="selection-toolbar hidden">
             <label class="select-all-label" for="select-all">
                 <input id="select-all" type="checkbox" />

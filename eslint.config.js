@@ -30,6 +30,8 @@ export default [
                 test: "readonly",
                 assert: "readonly",
                 process: "readonly",
+                globalThis: "readonly",
+                window: "readonly",
             },
         },
         rules: {

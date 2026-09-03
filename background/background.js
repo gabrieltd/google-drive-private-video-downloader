@@ -2,6 +2,17 @@ import { parseDriveVideoResponse } from "../lib/drive-parser.js";
 import { MESSAGE_TYPES } from "../lib/messages.js";
 import { createTabStateManager } from "../lib/tab-state.js";
 import {
+    FOLDER_CANDIDATE_STATUSES,
+    FOLDER_SCAN_STATUSES,
+    candidateMatchesVideo,
+    createFolderScanState,
+    dedupeFolderCandidates,
+    getNextPendingCandidate,
+    normalizeFolderCandidate,
+    retryFailedFolderCandidates,
+    updateFolderCandidate,
+} from "../lib/folder-scan.js";
+import {
     createVideoRecord,
     formatIdentity,
     sanitizeFilename,
@@ -9,6 +20,13 @@ import {
 } from "../lib/video-model.js";
 import {
     isGoogleDriveUrl,
+    extractDriveFileIdFromUrl,
+    extractDriveFolderId,
+    extractDriveMediaFileId,
+    extractDrivePlaybackFileId,
+    isDriveAudioMediaRequest,
+    isGoogleDriveFolderUrl,
+    isPotentialDriveMediaRequest,
     isPotentialDrivePlaybackRequest,
     shouldAttachDebugger,
 } from "../lib/url-utils.js";
@@ -26,6 +44,14 @@ const cleanupTabs = new Set();
 const expectedDetachTabs = new Set();
 const expectedDetachTimers = new Map();
 const lastDetachAt = new Map();
+const folderScanRuntime = new Map();
+const expectedFolderNavigations = new Map();
+const FOLDER_CANDIDATE_TIMEOUT_MS = 20_000;
+const ACTIVE_FOLDER_SCAN_STATUSES = new Set([
+    FOLDER_SCAN_STATUSES.DISCOVERING,
+    FOLDER_SCAN_STATUSES.COLLECTING,
+    FOLDER_SCAN_STATUSES.PAUSED,
+]);
 
 function debugLog(...args) {
     if (DEBUG) console.debug("[Drive Video Downloader]", ...args);
@@ -188,6 +214,107 @@ async function runWithConcurrency(tasks, concurrency = 3) {
     return results;
 }
 
+function createScanId() {
+    if (typeof globalThis.crypto?.randomUUID === "function") return globalThis.crypto.randomUUID();
+    return `scan-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
+function isActiveFolderScan(scan) {
+    return ACTIVE_FOLDER_SCAN_STATUSES.has(scan?.status);
+}
+
+function folderRuntimeFor(tabId, scanId = null) {
+    const runtime = folderScanRuntime.get(tabId);
+    return runtime && (!scanId || runtime.scanId === scanId) ? runtime : null;
+}
+
+function clearFolderCandidateTimer(tabId) {
+    const runtime = folderScanRuntime.get(tabId);
+    if (runtime?.candidateTimer) clearTimeout(runtime.candidateTimer);
+    if (runtime) runtime.candidateTimer = null;
+}
+
+function notifyFolderScan(tabId) {
+    const state = stateFor(tabId);
+    sendRuntimeEvent({
+        type: MESSAGE_TYPES.FOLDER_SCAN_UPDATED,
+        tabId,
+        folderScan: state.folderScan,
+        state,
+        videos: state.videos,
+    });
+}
+
+function notifyStateAndFolderScan(tabId) {
+    notifyTabState(tabId);
+    notifyFolderScan(tabId);
+}
+
+function sendTabMessage(tabId, message) {
+    return chromeCall(chrome.tabs.sendMessage.bind(chrome.tabs), tabId, message).catch(() => null);
+}
+
+function stopFolderRuntime(tabId, notifyContent = false) {
+    const runtime = folderScanRuntime.get(tabId);
+    if (runtime) {
+        runtime.cancelled = true;
+        clearFolderCandidateTimer(tabId);
+        if (notifyContent && runtime.scanId) {
+            void sendTabMessage(tabId, { type: MESSAGE_TYPES.FOLDER_SCANNER_CANCEL, scanId: runtime.scanId });
+        }
+    }
+    folderScanRuntime.delete(tabId);
+    expectedFolderNavigations.delete(tabId);
+}
+
+function setExpectedFolderNavigation(tabId, navigation) {
+    expectedFolderNavigations.set(tabId, navigation);
+}
+
+function expectedNavigationMatches(tabId, url) {
+    const expected = expectedFolderNavigations.get(tabId);
+    if (!expected) return false;
+    if (expected.kind === "candidate") return extractDriveFileIdFromUrl(url) === expected.fileId;
+    return extractDriveFolderId(url) === expected.folderId;
+}
+
+function clearExpectedFolderNavigation(tabId) {
+    expectedFolderNavigations.delete(tabId);
+}
+
+function scanErrorMessage(error) {
+    if (/active tab|not active/i.test(error?.message ?? "")) return "Keep the Drive folder tab active while scanning.";
+    return "Unable to inspect this Drive folder.";
+}
+
+function sendFolderScannerCommand(tabId, scanId, type) {
+    return sendTabMessage(tabId, { type, scanId });
+}
+
+async function persistAndNotifyFolderScan(tabId) {
+    await tabState.persist();
+    notifyStateAndFolderScan(tabId);
+}
+
+async function markFolderScanError(tabId, scanId, error) {
+    const scan = tabState.getFolderScan(tabId);
+    if (scan.id !== scanId || !isActiveFolderScan(scan)) return false;
+    clearFolderCandidateTimer(tabId);
+    const runtime = folderRuntimeFor(tabId, scanId);
+    if (runtime) runtime.cancelled = true;
+    clearExpectedFolderNavigation(tabId);
+    tabState.updateFolderScan(tabId, {
+        status: FOLDER_SCAN_STATUSES.ERROR,
+        currentFileId: null,
+        currentFileName: null,
+        deadlineAt: null,
+        error: typeof error === "string" ? error : "Unable to inspect this Drive folder.",
+        pauseReason: null,
+    });
+    await persistAndNotifyFolderScan(tabId);
+    return true;
+}
+
 function attachDebugger(tabId) {
     return chromeCall(chrome.debugger.attach.bind(chrome.debugger), { tabId }, "1.3").catch((error) => {
         if (/already attached|debugger is already attached/i.test(error.message)) return undefined;
@@ -209,6 +336,7 @@ async function cleanupTabResourcesInternal(
 ) {
     cleanupTabs.add(tabId);
     try {
+        if (clearVideos || removeState) stopFolderRuntime(tabId, true);
         const state = stateFor(tabId);
         if (detach && (forceDetach || state.debuggerAttached)) {
             try {
@@ -239,6 +367,8 @@ export function cleanupTabResources(tabId, options) {
 
 async function disableCapture(tabId) {
     return operationForTab(tabId, async () => {
+        const scan = tabState.getFolderScan(tabId);
+        if (isActiveFolderScan(scan)) await cancelFolderScanInternal(tabId, "Folder scan cancelled.", false);
         tabState.disableTab(tabId);
         await cleanupTabResourcesInternal(tabId, {
             clearVideos: false,
@@ -283,8 +413,9 @@ async function detachInactiveTabInternal(tabId) {
     tabState.setDebuggerAttached(tabId, false);
     if (!detachError) tabState.setLastError(tabId, null);
     removePendingRequests(tabId);
+    await pauseFolderScan(tabId, "Return to this Drive tab to continue.");
     await tabState.persist();
-    notifyTabState(tabId);
+    notifyStateAndFolderScan(tabId);
     return true;
 }
 
@@ -327,6 +458,347 @@ async function startCapture(tabId) {
     });
 }
 
+async function injectFolderScanner(tabId, scanId) {
+    await chromeCall(
+        chrome.scripting.executeScript.bind(chrome.scripting),
+        { target: { tabId }, files: ["content/folder-scanner.js"] },
+    );
+    await sendTabMessage(tabId, { type: MESSAGE_TYPES.FOLDER_SCANNER_START, scanId });
+}
+
+async function startFolderDiscovery(tabId, scanId) {
+    const runtime = folderRuntimeFor(tabId, scanId);
+    if (!runtime || runtime.discoveryStarted) return true;
+    runtime.discoveryStarted = true;
+    try {
+        await injectFolderScanner(tabId, scanId);
+        return true;
+    } catch (error) {
+        runtime.discoveryStarted = false;
+        throw error;
+    }
+}
+
+function armFolderCandidateTimer(tabId, scanId, fileId, deadlineAt) {
+    clearFolderCandidateTimer(tabId);
+    const runtime = folderRuntimeFor(tabId, scanId);
+    if (!runtime) return;
+    const delay = Math.max(0, deadlineAt - Date.now());
+    runtime.candidateTimer = setTimeout(() => {
+        void handleFolderCandidateTimeout(tabId, scanId, fileId);
+    }, delay);
+}
+
+async function completeFolderScan(tabId, scanId) {
+    const scan = tabState.getFolderScan(tabId);
+    if (scan.id !== scanId || scan.status !== FOLDER_SCAN_STATUSES.COLLECTING) return false;
+    clearFolderCandidateTimer(tabId);
+    const returnUrl = scan.returnUrl;
+    tabState.updateFolderScan(tabId, {
+        status: FOLDER_SCAN_STATUSES.COMPLETED,
+        currentIndex: scan.candidates.length,
+        currentFileId: null,
+        currentFileName: null,
+        deadlineAt: null,
+        pauseReason: null,
+        error: null,
+    });
+    await persistAndNotifyFolderScan(tabId);
+
+    const tab = await chromeCall(chrome.tabs.get.bind(chrome.tabs), tabId).catch(() => null);
+    if (tab && isGoogleDriveUrl(tab.url) && returnUrl && tab.url !== returnUrl) {
+        setExpectedFolderNavigation(tabId, {
+            kind: "return",
+            scanId,
+            folderId: scan.folderId,
+        });
+        await chromeCall(chrome.tabs.update.bind(chrome.tabs), tabId, { url: returnUrl }).catch((error) => {
+            debugLog("Unable to return to the original Drive folder", error.message);
+        });
+    }
+    clearExpectedFolderNavigation(tabId);
+    folderScanRuntime.delete(tabId);
+    return true;
+}
+
+async function failFolderCandidate(tabId, scanId, fileId, error) {
+    const scan = tabState.getFolderScan(tabId);
+    if (scan.id !== scanId || scan.status !== FOLDER_SCAN_STATUSES.COLLECTING) return false;
+    const candidate = scan.candidates.find((item) => item.fileId === fileId);
+    if (!candidate || candidate.status !== FOLDER_CANDIDATE_STATUSES.PROCESSING) return false;
+
+    clearFolderCandidateTimer(tabId);
+    const index = scan.candidates.findIndex((item) => item.fileId === fileId);
+    clearExpectedFolderNavigation(tabId);
+    tabState.updateFolderScan(tabId, {
+        candidates: updateFolderCandidate(scan.candidates, fileId, {
+            status: FOLDER_CANDIDATE_STATUSES.FAILED,
+            error: String(error),
+        }),
+        currentIndex: index + 1,
+        currentFileId: null,
+        currentFileName: null,
+        deadlineAt: null,
+    });
+    await persistAndNotifyFolderScan(tabId);
+    return true;
+}
+
+async function handleFolderCandidateTimeout(tabId, scanId, fileId) {
+    const failed = await failFolderCandidate(
+        tabId,
+        scanId,
+        fileId,
+        "Playback stream was not detected before timeout.",
+    );
+    if (failed) requestFolderAdvance(tabId, scanId);
+}
+
+async function handleFolderAudioMediaRequest(tabId, url) {
+    if (!isDriveAudioMediaRequest(url)) return false;
+
+    const scan = tabState.getFolderScan(tabId);
+    if (scan.status !== FOLDER_SCAN_STATUSES.COLLECTING || !scan.currentFileId) return false;
+    if (extractDriveMediaFileId(url) !== scan.currentFileId) return false;
+
+    const failed = await failFolderCandidate(
+        tabId,
+        scan.id,
+        scan.currentFileId,
+        "Drive is serving separate video and audio streams. This V1 supports directly downloadable progressive streams only.",
+    );
+    if (failed) requestFolderAdvance(tabId, scan.id);
+    return failed;
+}
+
+async function handleFolderVideoCapture(tabId, video, playbackFileId, responseCreatedAt = null) {
+    const scan = tabState.getFolderScan(tabId);
+    if (scan.status !== FOLDER_SCAN_STATUSES.COLLECTING || !scan.currentFileId) return false;
+
+    const candidate = scan.candidates.find((item) => item.fileId === scan.currentFileId);
+    if (!candidate || candidate.status !== FOLDER_CANDIDATE_STATUSES.PROCESSING) return false;
+    if (candidate.startedAt && responseCreatedAt && responseCreatedAt < candidate.startedAt) return false;
+    if (!candidateMatchesVideo(candidate, video, playbackFileId)) return false;
+
+    const hasProgressive = (video.formats ?? []).some((format) => format.progressive === true);
+    const index = scan.candidates.findIndex((item) => item.fileId === candidate.fileId);
+    const candidateUpdate = hasProgressive
+        ? {
+              status: FOLDER_CANDIDATE_STATUSES.CAPTURED,
+              videoId: video.id,
+              error: null,
+          }
+        : {
+              status: FOLDER_CANDIDATE_STATUSES.FAILED,
+              videoId: video.id,
+              error: "No directly downloadable progressive stream was found.",
+          };
+
+    clearFolderCandidateTimer(tabId);
+    tabState.updateFolderScan(tabId, {
+        candidates: updateFolderCandidate(scan.candidates, candidate.fileId, candidateUpdate),
+        currentIndex: index + 1,
+        currentFileId: null,
+        currentFileName: null,
+        deadlineAt: null,
+    });
+    await persistAndNotifyFolderScan(tabId);
+    requestFolderAdvance(tabId, scan.id);
+    return true;
+}
+
+async function advanceFolderScan(tabId, scanId) {
+    const scan = tabState.getFolderScan(tabId);
+    if (scan.id !== scanId || scan.status !== FOLDER_SCAN_STATUSES.COLLECTING) return;
+    if (scan.currentFileId) return;
+
+    const candidate = getNextPendingCandidate(scan.candidates);
+    if (!candidate) {
+        await completeFolderScan(tabId, scanId);
+        return;
+    }
+
+    const tab = await chromeCall(chrome.tabs.get.bind(chrome.tabs), tabId).catch(() => null);
+    if (!tab || tab.active !== true || !isGoogleDriveUrl(tab.url)) {
+        await pauseFolderScan(tabId, "Return to this Drive tab to continue.");
+        return;
+    }
+    const previousCandidate = scan.currentIndex > 0 ? scan.candidates[scan.currentIndex - 1] : null;
+    const isPreviousCandidatePage = extractDriveFileIdFromUrl(tab.url) === previousCandidate?.fileId;
+    if (extractDriveFolderId(tab.url) !== scan.folderId && !isPreviousCandidatePage) {
+        await cancelFolderScanInternal(tabId, "Folder scan stopped because the Drive tab navigation changed.");
+        return;
+    }
+
+    const index = scan.candidates.findIndex((item) => item.fileId === candidate.fileId);
+    const deadlineAt = Date.now() + FOLDER_CANDIDATE_TIMEOUT_MS;
+    tabState.updateFolderScan(tabId, {
+        candidates: updateFolderCandidate(scan.candidates, candidate.fileId, {
+            status: FOLDER_CANDIDATE_STATUSES.PROCESSING,
+            attempts: candidate.attempts + 1,
+            startedAt: Date.now(),
+            error: null,
+        }),
+        currentIndex: index,
+        currentFileId: candidate.fileId,
+        currentFileName: candidate.name,
+        deadlineAt,
+        pauseReason: null,
+        error: null,
+    });
+    removePendingRequests(tabId);
+    setExpectedFolderNavigation(tabId, { kind: "candidate", scanId, fileId: candidate.fileId });
+    await persistAndNotifyFolderScan(tabId);
+    armFolderCandidateTimer(tabId, scanId, candidate.fileId, deadlineAt);
+
+    try {
+        const currentFileId = extractDriveFileIdFromUrl(tab.url);
+        if (currentFileId === candidate.fileId) {
+            await chromeCall(chrome.tabs.reload.bind(chrome.tabs), tabId);
+        } else {
+            await chromeCall(chrome.tabs.update.bind(chrome.tabs), tabId, { url: candidate.url });
+        }
+    } catch (error) {
+        clearExpectedFolderNavigation(tabId);
+        const failed = await failFolderCandidate(tabId, scanId, candidate.fileId, "Unable to open this Drive video.");
+        if (failed) debugLog("Folder candidate navigation failed", error.message);
+    }
+}
+
+function requestFolderAdvance(tabId, scanId) {
+    setTimeout(() => void processNextFolderCandidate(tabId, scanId), 0);
+}
+
+async function processNextFolderCandidate(tabId, scanId) {
+    const runtime = folderRuntimeFor(tabId, scanId);
+    if (!runtime || runtime.cancelled || runtime.advancePromise) return;
+    runtime.advancePromise = advanceFolderScan(tabId, scanId)
+        .catch((error) => markFolderScanError(tabId, scanId, "Unable to continue the folder scan.").catch(() => {
+            console.error("Folder scan continuation failed", error);
+        }))
+        .finally(() => {
+            runtime.advancePromise = null;
+            const next = tabState.getFolderScan(tabId);
+            if (folderRuntimeFor(tabId, scanId) && next.status === FOLDER_SCAN_STATUSES.COLLECTING && !next.currentFileId) {
+                requestFolderAdvance(tabId, scanId);
+            }
+        });
+    await runtime.advancePromise;
+}
+
+async function pauseFolderScan(tabId, reason) {
+    const scan = tabState.getFolderScan(tabId);
+    if (!isActiveFolderScan(scan) || scan.status === FOLDER_SCAN_STATUSES.PAUSED) return false;
+    clearFolderCandidateTimer(tabId);
+    const runtime = folderRuntimeFor(tabId, scan.id);
+    if (runtime) runtime.cancelled = scan.status === FOLDER_SCAN_STATUSES.DISCOVERING;
+    if (scan.status === FOLDER_SCAN_STATUSES.DISCOVERING && scan.id) {
+        await sendFolderScannerCommand(tabId, scan.id, MESSAGE_TYPES.FOLDER_SCANNER_CANCEL);
+        if (runtime) runtime.discoveryStarted = false;
+    }
+    tabState.updateFolderScan(tabId, {
+        status: FOLDER_SCAN_STATUSES.PAUSED,
+        pauseReason: reason,
+        error: null,
+    });
+    await persistAndNotifyFolderScan(tabId);
+    return true;
+}
+
+async function resumeFolderScan(tabId) {
+    const scan = tabState.getFolderScan(tabId);
+    if (scan.status !== FOLDER_SCAN_STATUSES.PAUSED || !scan.id) return false;
+    const tab = await chromeCall(chrome.tabs.get.bind(chrome.tabs), tabId).catch(() => null);
+    if (!tab || tab.active !== true || !isGoogleDriveUrl(tab.url)) return false;
+
+    const previousCandidate = scan.currentIndex > 0 ? scan.candidates[scan.currentIndex - 1] : null;
+    const isPreviousCandidatePage = scan.total > 0
+        && extractDriveFileIdFromUrl(tab.url) === previousCandidate?.fileId;
+    if (!scan.currentFileId && extractDriveFolderId(tab.url) !== scan.folderId && !isPreviousCandidatePage) {
+        await cancelFolderScanInternal(tabId, "Folder scan stopped because the Drive tab navigation changed.");
+        return false;
+    }
+
+    const runtime = folderRuntimeFor(tabId, scan.id) ?? { scanId: scan.id, cancelled: false, candidateTimer: null, advancePromise: null };
+    runtime.cancelled = false;
+    folderScanRuntime.set(tabId, runtime);
+
+    if (scan.currentFileId) {
+        const candidate = scan.candidates.find((item) => item.fileId === scan.currentFileId);
+        if (!candidate) return false;
+        if (candidate.status !== FOLDER_CANDIDATE_STATUSES.PROCESSING) {
+            tabState.updateFolderScan(tabId, {
+                candidates: updateFolderCandidate(scan.candidates, candidate.fileId, {
+                    status: FOLDER_CANDIDATE_STATUSES.PROCESSING,
+                    startedAt: Date.now(),
+                    error: null,
+                }),
+            });
+        }
+        if (scan.deadlineAt && scan.deadlineAt <= Date.now()) {
+            const failed = await failFolderCandidate(tabId, scan.id, candidate.fileId, "Playback stream was not detected before timeout.");
+            if (failed) requestFolderAdvance(tabId, scan.id);
+            return true;
+        }
+
+        const deadlineAt = Date.now() + FOLDER_CANDIDATE_TIMEOUT_MS;
+        tabState.updateFolderScan(tabId, { status: FOLDER_SCAN_STATUSES.COLLECTING, pauseReason: null, deadlineAt, error: null });
+        await persistAndNotifyFolderScan(tabId);
+        armFolderCandidateTimer(tabId, scan.id, candidate.fileId, deadlineAt);
+        setExpectedFolderNavigation(tabId, { kind: "candidate", scanId: scan.id, fileId: candidate.fileId });
+        const currentFileId = extractDriveFileIdFromUrl(tab.url);
+        if (currentFileId === candidate.fileId) {
+            await chromeCall(chrome.tabs.reload.bind(chrome.tabs), tabId).catch(() => undefined);
+        }
+        else await chromeCall(chrome.tabs.update.bind(chrome.tabs), tabId, { url: candidate.url }).catch(() => undefined);
+        return true;
+    }
+
+    if (scan.total > 0) {
+        tabState.updateFolderScan(tabId, { status: FOLDER_SCAN_STATUSES.COLLECTING, pauseReason: null, error: null });
+        await persistAndNotifyFolderScan(tabId);
+        requestFolderAdvance(tabId, scan.id);
+        return true;
+    }
+
+    tabState.updateFolderScan(tabId, { status: FOLDER_SCAN_STATUSES.DISCOVERING, pauseReason: null, error: null });
+    await persistAndNotifyFolderScan(tabId);
+    try {
+        await startFolderDiscovery(tabId, scan.id);
+    } catch (error) {
+        await markFolderScanError(tabId, scan.id, scanErrorMessage(error));
+        return false;
+    }
+    return true;
+}
+
+async function cancelFolderScanInternal(tabId, message = "Folder scan cancelled.", persist = true) {
+    const scan = tabState.getFolderScan(tabId);
+    if (!isActiveFolderScan(scan)) return false;
+    const runtime = folderRuntimeFor(tabId, scan.id);
+    if (runtime) runtime.cancelled = true;
+    clearFolderCandidateTimer(tabId);
+    if (scan.status === FOLDER_SCAN_STATUSES.DISCOVERING && scan.id) {
+        await sendFolderScannerCommand(tabId, scan.id, MESSAGE_TYPES.FOLDER_SCANNER_CANCEL);
+    }
+    const candidates = scan.candidates.map((candidate) => candidate.status === FOLDER_CANDIDATE_STATUSES.PROCESSING
+        ? { ...candidate, status: FOLDER_CANDIDATE_STATUSES.PENDING, error: null }
+        : candidate);
+    tabState.updateFolderScan(tabId, {
+        status: FOLDER_SCAN_STATUSES.CANCELLED,
+        candidates,
+        currentFileId: null,
+        currentFileName: null,
+        deadlineAt: null,
+        pauseReason: null,
+        error: message,
+    });
+    clearExpectedFolderNavigation(tabId);
+    folderScanRuntime.delete(tabId);
+    if (persist) await persistAndNotifyFolderScan(tabId);
+    return true;
+}
+
 function decodeResponseBody(body, base64Encoded) {
     if (!base64Encoded) return body;
     try {
@@ -366,14 +838,21 @@ async function processResponse(tabId, requestId, request) {
 
         const video = createVideoRecord(parsedVideo, tabId);
         const resultForVideo = tabState.addOrUpdateVideo(tabId, video);
-        if (!resultForVideo.changed) return;
+        if (resultForVideo.changed) {
+            await tabState.persist();
+            await updateBadge(tabId);
+            notifyVideoChange(
+                tabId,
+                resultForVideo.isNew ? MESSAGE_TYPES.VIDEO_DETECTED : MESSAGE_TYPES.VIDEO_UPDATED,
+                resultForVideo.video,
+            );
+        }
 
-        await tabState.persist();
-        await updateBadge(tabId);
-        notifyVideoChange(
+        await handleFolderVideoCapture(
             tabId,
-            resultForVideo.isNew ? MESSAGE_TYPES.VIDEO_DETECTED : MESSAGE_TYPES.VIDEO_UPDATED,
             resultForVideo.video,
+            extractDrivePlaybackFileId(request.url),
+            request.createdAt,
         );
     });
 }
@@ -384,6 +863,10 @@ async function handleDebuggerEvent(debuggeeId, method, params) {
 
     if (method === "Network.requestWillBeSent") {
         const url = params?.request?.url;
+        if (isPotentialDriveMediaRequest(url)) {
+            await handleFolderAudioMediaRequest(tabId, url);
+            return;
+        }
         if (!isPotentialDrivePlaybackRequest(url)) return;
         removeExpiredRequests(tabId);
         pendingRequests.set(requestKey(tabId, params.requestId), { tabId, url, createdAt: Date.now() });
@@ -477,6 +960,207 @@ async function downloadVideos(tabId, videoIds) {
     return { success: results.some((result) => result.success), results };
 }
 
+async function startFolderScan(tabId) {
+    if (!Number.isInteger(tabId)) return { success: false, error: "No active tab." };
+    const tab = await chromeCall(chrome.tabs.get.bind(chrome.tabs), tabId).catch(() => null);
+    if (!tab || tab.active !== true || !isGoogleDriveFolderUrl(tab.url)) {
+        return { success: false, error: "Open a Google Drive folder to scan videos." };
+    }
+
+    const previousScan = tabState.getFolderScan(tabId);
+    if (isActiveFolderScan(previousScan)) {
+        return { success: false, error: "A folder scan is already in progress.", state: stateFor(tabId) };
+    }
+
+    const scanId = createScanId();
+    folderScanRuntime.set(tabId, {
+        scanId,
+        cancelled: false,
+        candidateTimer: null,
+        advancePromise: null,
+    });
+    tabState.enableTab(tabId);
+    tabState.updateFolderScan(tabId, {
+        ...createFolderScanState({ now: Date.now() }),
+        id: scanId,
+        status: FOLDER_SCAN_STATUSES.DISCOVERING,
+        folderId: extractDriveFolderId(tab.url),
+        folderUrl: tab.url,
+        returnUrl: tab.url,
+        startedAt: Date.now(),
+        updatedAt: Date.now(),
+    });
+    await persistAndNotifyFolderScan(tabId);
+
+    if (!await startCapture(tabId)) {
+        await markFolderScanError(tabId, scanId, stateFor(tabId).lastError ?? "Unable to start capture for this Drive tab.");
+        folderScanRuntime.delete(tabId);
+        return { success: false, error: stateFor(tabId).lastError, state: stateFor(tabId) };
+    }
+
+    try {
+        await startFolderDiscovery(tabId, scanId);
+    } catch (error) {
+        await markFolderScanError(tabId, scanId, scanErrorMessage(error));
+        folderScanRuntime.delete(tabId);
+        return { success: false, error: scanErrorMessage(error), state: stateFor(tabId) };
+    }
+
+    return { success: true, state: stateFor(tabId), videos: tabState.getVideosForTab(tabId) };
+}
+
+async function handleDiscoveryProgress(tabId, message) {
+    const scan = tabState.getFolderScan(tabId);
+    if (scan.id !== message.scanId || scan.status !== FOLDER_SCAN_STATUSES.DISCOVERING) return false;
+    const discoveredCount = Number.isInteger(message.discoveredCount) && message.discoveredCount >= 0
+        ? Math.max(scan.discoveredCount, message.discoveredCount)
+        : scan.discoveredCount;
+    tabState.updateFolderScan(tabId, { discoveredCount });
+    await persistAndNotifyFolderScan(tabId);
+    return true;
+}
+
+async function handleDiscoveryComplete(tabId, message) {
+    const scan = tabState.getFolderScan(tabId);
+    if (scan.id !== message.scanId || scan.status !== FOLDER_SCAN_STATUSES.DISCOVERING) return false;
+    const candidates = dedupeFolderCandidates(message.candidates).map((candidate) => normalizeFolderCandidate(candidate)).filter(Boolean);
+    if (candidates.length === 0) {
+        tabState.updateFolderScan(tabId, {
+            status: FOLDER_SCAN_STATUSES.COMPLETED,
+            candidates: [],
+            total: 0,
+            currentIndex: 0,
+            currentFileId: null,
+            currentFileName: null,
+            discoveredCount: 0,
+            error: null,
+        });
+        await persistAndNotifyFolderScan(tabId);
+        folderScanRuntime.delete(tabId);
+        return true;
+    }
+
+    tabState.updateFolderScan(tabId, {
+        status: FOLDER_SCAN_STATUSES.COLLECTING,
+        candidates,
+        total: candidates.length,
+        currentIndex: 0,
+        currentFileId: null,
+        currentFileName: null,
+        discoveredCount: candidates.length,
+        error: null,
+        pauseReason: null,
+    });
+    await persistAndNotifyFolderScan(tabId);
+    requestFolderAdvance(tabId, message.scanId);
+    return true;
+}
+
+async function handleDiscoveryFailed(tabId, message) {
+    const scan = tabState.getFolderScan(tabId);
+    if (scan.id !== message.scanId || scan.status !== FOLDER_SCAN_STATUSES.DISCOVERING) return false;
+    await markFolderScanError(tabId, message.scanId, "Unable to inspect this Drive folder.");
+    folderScanRuntime.delete(tabId);
+    return true;
+}
+
+async function handleDiscoveryCancelled(tabId, message) {
+    const scan = tabState.getFolderScan(tabId);
+    if (scan.id !== message.scanId || scan.status !== FOLDER_SCAN_STATUSES.DISCOVERING) return false;
+    await cancelFolderScanInternal(tabId);
+    return true;
+}
+
+async function retryFailedFolderScan(tabId) {
+    if (!Number.isInteger(tabId)) return { success: false, error: "No active tab." };
+    const scan = tabState.getFolderScan(tabId);
+    const failedCount = scan.candidates.filter((candidate) => candidate.status === FOLDER_CANDIDATE_STATUSES.FAILED).length;
+    if (failedCount === 0) return { success: false, error: "There are no failed videos to retry." };
+    if (isActiveFolderScan(scan)) return { success: false, error: "A folder scan is already in progress." };
+
+    const tab = await chromeCall(chrome.tabs.get.bind(chrome.tabs), tabId).catch(() => null);
+    if (!tab || tab.active !== true || extractDriveFolderId(tab.url) !== scan.folderId) {
+        return { success: false, error: "Return to the original Google Drive folder to retry failed videos." };
+    }
+
+    folderScanRuntime.set(tabId, { scanId: scan.id, cancelled: false, candidateTimer: null, advancePromise: null });
+    tabState.enableTab(tabId);
+    tabState.updateFolderScan(tabId, {
+        status: FOLDER_SCAN_STATUSES.COLLECTING,
+        candidates: retryFailedFolderCandidates(scan.candidates),
+        currentIndex: 0,
+        currentFileId: null,
+        currentFileName: null,
+        deadlineAt: null,
+        pauseReason: null,
+        error: null,
+    });
+    await persistAndNotifyFolderScan(tabId);
+    if (!await startCapture(tabId)) {
+        await markFolderScanError(tabId, scan.id, stateFor(tabId).lastError ?? "Unable to start capture for this Drive tab.");
+        folderScanRuntime.delete(tabId);
+        return { success: false, error: stateFor(tabId).lastError, state: stateFor(tabId) };
+    }
+    requestFolderAdvance(tabId, scan.id);
+    return { success: true, state: stateFor(tabId), videos: tabState.getVideosForTab(tabId) };
+}
+
+async function recoverFolderScan(state, tab) {
+    const scan = state.folderScan;
+    if (!isActiveFolderScan(scan)) return;
+    if (!tab || !isGoogleDriveUrl(tab.url)) return;
+    const previousCandidate = scan.currentIndex > 0 ? scan.candidates[scan.currentIndex - 1] : null;
+    const isPreviousCandidatePage = scan.total > 0
+        && extractDriveFileIdFromUrl(tab.url) === previousCandidate?.fileId;
+    if (!scan.currentFileId && extractDriveFolderId(tab.url) !== scan.folderId && !isPreviousCandidatePage) {
+        await cancelFolderScanInternal(state.tabId, "Folder scan stopped because the Drive tab navigation changed.");
+        return;
+    }
+
+    if (tab.active !== true) {
+        if (scan.status !== FOLDER_SCAN_STATUSES.PAUSED) {
+            tabState.updateFolderScan(state.tabId, {
+                status: FOLDER_SCAN_STATUSES.PAUSED,
+                pauseReason: "Return to this Drive tab to continue.",
+            });
+            await persistAndNotifyFolderScan(state.tabId);
+        }
+        return;
+    }
+
+    folderScanRuntime.set(state.tabId, {
+        scanId: scan.id,
+        cancelled: false,
+        candidateTimer: null,
+        advancePromise: null,
+    });
+    if (!await startCapture(state.tabId)) return;
+
+    const currentScan = tabState.getFolderScan(state.tabId);
+    if (currentScan.status === FOLDER_SCAN_STATUSES.PAUSED) {
+        await resumeFolderScan(state.tabId);
+        return;
+    }
+    if (currentScan.status === FOLDER_SCAN_STATUSES.COLLECTING && currentScan.currentFileId) {
+        tabState.updateFolderScan(state.tabId, {
+            status: FOLDER_SCAN_STATUSES.PAUSED,
+            pauseReason: "Capture is recovering after a service worker restart.",
+        });
+        await persistAndNotifyFolderScan(state.tabId);
+        await resumeFolderScan(state.tabId);
+        return;
+    }
+    if (currentScan.status === FOLDER_SCAN_STATUSES.DISCOVERING) {
+        try {
+        await startFolderDiscovery(state.tabId, currentScan.id);
+        } catch (error) {
+            await markFolderScanError(state.tabId, currentScan.id, scanErrorMessage(error));
+        }
+        return;
+    }
+    requestFolderAdvance(state.tabId, currentScan.id);
+}
+
 async function handleMessage(message, sender) {
     if (!message || !message.type) return { success: false, error: "Invalid message." };
     const tabId = Number.isInteger(message.tabId) ? message.tabId : sender?.tab?.id;
@@ -486,8 +1170,41 @@ async function handleMessage(message, sender) {
         const tab = await chromeCall(chrome.tabs.get.bind(chrome.tabs), tabId).catch(() => null);
         if (tab?.active && isGoogleDriveUrl(tab.url) && tabState.isTabEnabled(tabId)) {
             await startCapture(tabId);
+            if (tabState.getFolderScan(tabId).status === FOLDER_SCAN_STATUSES.PAUSED) await resumeFolderScan(tabId);
         }
         return { success: true, state: stateFor(tabId), videos: tabState.getVideosForTab(tabId) };
+    }
+
+    if (message.type === MESSAGE_TYPES.START_FOLDER_SCAN) return startFolderScan(tabId);
+
+    if (message.type === MESSAGE_TYPES.CANCEL_FOLDER_SCAN) {
+        if (!Number.isInteger(tabId)) return { success: false, error: "No active tab." };
+        const cancelled = await cancelFolderScanInternal(tabId);
+        return cancelled
+            ? { success: true, state: stateFor(tabId), videos: tabState.getVideosForTab(tabId) }
+            : { success: false, error: "No folder scan is in progress.", state: stateFor(tabId) };
+    }
+
+    if (message.type === MESSAGE_TYPES.RETRY_FAILED_FOLDER_SCAN) return retryFailedFolderScan(tabId);
+
+    if (message.type === MESSAGE_TYPES.FOLDER_DISCOVERY_PROGRESS) {
+        await handleDiscoveryProgress(tabId, message);
+        return { success: true };
+    }
+
+    if (message.type === MESSAGE_TYPES.FOLDER_DISCOVERY_COMPLETE) {
+        await handleDiscoveryComplete(tabId, message);
+        return { success: true };
+    }
+
+    if (message.type === MESSAGE_TYPES.FOLDER_DISCOVERY_FAILED) {
+        await handleDiscoveryFailed(tabId, message);
+        return { success: true };
+    }
+
+    if (message.type === MESSAGE_TYPES.FOLDER_DISCOVERY_CANCELLED) {
+        await handleDiscoveryCancelled(tabId, message);
+        return { success: true };
     }
 
     if (message.type === MESSAGE_TYPES.SET_TAB_ENABLED) {
@@ -538,6 +1255,9 @@ async function handleMessage(message, sender) {
 
     if (message.type === MESSAGE_TYPES.CLEAR_VIDEOS) {
         if (!Number.isInteger(tabId)) return { success: false, error: "No active tab." };
+        if (isActiveFolderScan(tabState.getFolderScan(tabId))) {
+            return { success: false, error: "Cancel the folder scan before clearing the collection." };
+        }
         await operationForTab(tabId, async () => {
             tabState.clearTabVideos(tabId);
             await tabState.persist();
@@ -577,7 +1297,14 @@ const ready = initialize().catch((error) => console.error("Unable to hydrate ses
 
 ready.then(() => {
     for (const state of tabState.getAllStates()) {
-        if (state.enabled) void startCapture(state.tabId);
+        void chromeCall(chrome.tabs.get.bind(chrome.tabs), state.tabId)
+            .catch(() => null)
+            .then((tab) => {
+                if (isActiveFolderScan(state.folderScan)) return recoverFolderScan(state, tab);
+                if (state.enabled) return startCapture(state.tabId);
+                return undefined;
+            })
+            .catch((error) => console.error("Unable to recover tab state", error));
     }
 });
 
@@ -586,16 +1313,49 @@ async function handleTabActivated(activeInfo) {
     const states = tabState.getAllStates();
 
     for (const state of states) {
-        if (!state.enabled || state.tabId === activeInfo.tabId || !state.debuggerAttached) continue;
+        if (!state.enabled || state.tabId === activeInfo.tabId) continue;
         const tab = await chromeCall(chrome.tabs.get.bind(chrome.tabs), state.tabId).catch(() => null);
-        if (tab?.windowId === activeInfo.windowId && isGoogleDriveUrl(tab.url)) {
-            await detachInactiveTab(state.tabId);
+        if (tab && isGoogleDriveUrl(tab.url)) {
+            await pauseFolderScan(state.tabId, "Return to this Drive tab to continue.");
+            if (stateFor(state.tabId).debuggerAttached) await detachInactiveTab(state.tabId);
         }
     }
 
     if (activeTab && isGoogleDriveUrl(activeTab.url) && tabState.isTabEnabled(activeInfo.tabId)) {
         await startCapture(activeInfo.tabId);
+        if (tabState.getFolderScan(activeInfo.tabId).status === FOLDER_SCAN_STATUSES.PAUSED) {
+            await resumeFolderScan(activeInfo.tabId);
+        } else if (tabState.getFolderScan(activeInfo.tabId).status === FOLDER_SCAN_STATUSES.COLLECTING) {
+            requestFolderAdvance(activeInfo.tabId, tabState.getFolderScan(activeInfo.tabId).id);
+        }
     }
+}
+
+async function handleFolderNavigationUpdate(tabId, url) {
+    const scan = tabState.getFolderScan(tabId);
+    if (!isActiveFolderScan(scan) || !url) return false;
+
+    const expected = expectedNavigationMatches(tabId, url);
+    const fileId = extractDriveFileIdFromUrl(url);
+    const folderId = extractDriveFolderId(url);
+    if (expected) return true;
+
+    if (scan.status === FOLDER_SCAN_STATUSES.DISCOVERING || (!scan.currentFileId && folderId === scan.folderId)) {
+        if (folderId === scan.folderId) return true;
+    } else if (scan.currentFileId && fileId === scan.currentFileId) {
+        setExpectedFolderNavigation(tabId, {
+            kind: "candidate",
+            scanId: scan.id,
+            fileId: scan.currentFileId,
+        });
+        return true;
+    } else if (!scan.currentFileId && scan.total > 0 && scan.currentIndex > 0
+        && fileId === scan.candidates[scan.currentIndex - 1]?.fileId) {
+        return true;
+    }
+
+    await cancelFolderScanInternal(tabId, "Folder scan stopped because the Drive tab navigation changed.");
+    return false;
 }
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
@@ -628,20 +1388,25 @@ chrome.debugger.onDetach.addListener((source, reason) => {
 
         const tab = await chromeCall(chrome.tabs.get.bind(chrome.tabs), tabId).catch(() => null);
         if (expected || tab?.active !== true) {
+            await pauseFolderScan(tabId, "Return to this Drive tab to continue.");
             tabState.setLastError(tabId, null);
             await tabState.persist();
-            notifyTabState(tabId);
+            notifyStateAndFolderScan(tabId);
             return;
         }
 
         const state = stateFor(tabId);
         const external = EXTERNAL_DEBUGGER_REASONS.has(reason);
+        const activeScan = tabState.getFolderScan(tabId);
+        if (external && isActiveFolderScan(activeScan)) {
+            await markFolderScanError(tabId, activeScan.id, "Capture stopped because another debugging session is using this tab.");
+        }
         tabState.setLastError(
             tabId,
             external ? "Capture stopped because another debugging session is using this tab." : `Debugger detached: ${reason}.`,
         );
         await tabState.persist();
-        notifyTabState(tabId);
+        notifyStateAndFolderScan(tabId);
 
         const now = Date.now();
         const shouldRetry = state.enabled && !external && now - (lastDetachAt.get(tabId) ?? 0) > REATTACH_COOLDOWN_MS;
@@ -659,6 +1424,21 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
         }
 
         if (
+            url
+            && isGoogleDriveUrl(url)
+            && isActiveFolderScan(tabState.getFolderScan(tabId))
+            && (changeInfo.url || changeInfo.status === "complete")
+        ) {
+            const expected = await handleFolderNavigationUpdate(tabId, url);
+            if (!expected && !isActiveFolderScan(tabState.getFolderScan(tabId))) return;
+        }
+
+        if (changeInfo.status === "loading" && tabState.getFolderScan(tabId).status === FOLDER_SCAN_STATUSES.DISCOVERING) {
+            const runtime = folderRuntimeFor(tabId, tabState.getFolderScan(tabId).id);
+            if (runtime) runtime.discoveryStarted = false;
+        }
+
+        if (
             (changeInfo.url || changeInfo.status === "loading") &&
             isGoogleDriveUrl(url) &&
             tabState.isTabEnabled(tabId)
@@ -668,6 +1448,14 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
 
         if (changeInfo.status === "complete" && isGoogleDriveUrl(tab?.url) && tabState.isTabEnabled(tabId)) {
             await startCapture(tabId);
+            const scan = tabState.getFolderScan(tabId);
+            if (scan.status === FOLDER_SCAN_STATUSES.DISCOVERING && extractDriveFolderId(tab.url) === scan.folderId) {
+                try {
+                    await startFolderDiscovery(tabId, scan.id);
+                } catch (error) {
+                    await markFolderScanError(tabId, scan.id, scanErrorMessage(error));
+                }
+            }
         }
     }).catch((error) => console.error("Tab update handling failed", error));
 });

@@ -59,3 +59,18 @@ test("video records have deterministic identities and merge-friendly metadata", 
     }, 10);
     assert.equal(first.id, second.id);
 });
+
+test("prefers stable Drive IDs over playback session IDs for video identity", () => {
+    const first = createVideoRecord({
+        title: "Demo",
+        formats: [{ itag: 22, url: "https://example.test/video?id=one", progressive: true }],
+        sourceMetadata: { videoId: "session-one", driveId: "drive-file-1" },
+    }, 10);
+    const second = createVideoRecord({
+        title: "Demo",
+        formats: [{ itag: 37, url: "https://example.test/video?id=two", progressive: true }],
+        sourceMetadata: { videoId: "session-two", driveId: "drive-file-1" },
+    }, 10);
+
+    assert.equal(first.id, second.id);
+});

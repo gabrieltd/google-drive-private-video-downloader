@@ -31,6 +31,28 @@ test("parses multiple progressive formats without retaining raw response data", 
     assert.equal(Object.hasOwn(result, "rawBody"), false);
 });
 
+test("preserves all stable IDs needed to correlate a playback response", () => {
+    const result = parseDriveVideoResponse({
+        mediaMetadata: {
+            title: "Fixture video",
+            videoId: "playback-session-id",
+            driveId: "drive-id",
+            fileId: "file-id",
+        },
+        mediaStreamingData: {
+            formatStreamingData: { progressiveTranscodes: [progressive(22, 720)] },
+        },
+    });
+
+    assert.deepEqual(result.sourceMetadata, {
+        videoId: "playback-session-id",
+        driveId: "drive-id",
+        fileId: "file-id",
+        stableSourceKey: "source:file-id",
+        hasAdaptiveFormats: false,
+    });
+});
+
 test("recognizes adaptive formats but marks them as non-progressive", () => {
     const result = parseDriveVideoResponse({
         mediaStreamingData: {

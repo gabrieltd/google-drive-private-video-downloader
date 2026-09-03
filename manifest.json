@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Google Drive - Private Video Downloader",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Download video streams already delivered to your authenticated Google Drive session.",
   "icons": {
     "16": "assets/icon.png",
@@ -15,6 +15,7 @@
   "permissions": [
     "debugger",
     "activeTab",
+    "scripting",
     "tabs",
     "downloads",
     "storage"

@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createTabStateManager } from "../lib/tab-state.js";
+import { FOLDER_CANDIDATE_STATUSES, FOLDER_SCAN_STATUSES } from "../lib/folder-scan.js";
 
 test("tab state is independent and hydrates without debugger handles", async () => {
     let stored = {};
@@ -220,4 +221,47 @@ test("turning capture off preserves collection and selection", () => {
     assert.equal(manager.getState(20).enabled, false);
     assert.equal(manager.getVideosForTab(20).length, 2);
     assert.deepEqual(manager.getSelectedVideoIds(20), ["video-a"]);
+});
+
+test("persists folder scan progress independently from captured videos", async () => {
+    let stored = {};
+    const storage = {
+        async get(key) { return { [key]: stored[key] }; },
+        async set(value) { stored = { ...stored, ...value }; },
+    };
+    const manager = createTabStateManager({ storage });
+    manager.enableTab(30);
+    manager.addOrUpdateVideo(30, videoFixture("video-a"));
+    manager.setSelectedVideoIds(30, []);
+    manager.updateFolderScan(30, {
+        id: "scan-1",
+        status: FOLDER_SCAN_STATUSES.COLLECTING,
+        folderId: "FOLDER",
+        total: 2,
+        capturedCount: 1,
+        candidates: [
+            { fileId: "AAA", name: "A.mp4", status: FOLDER_CANDIDATE_STATUSES.CAPTURED },
+            { fileId: "BBB", name: "B.mp4", status: FOLDER_CANDIDATE_STATUSES.PROCESSING },
+        ],
+        currentFileId: "BBB",
+    });
+    await manager.persist();
+
+    const restored = createTabStateManager({ storage });
+    await restored.hydrate();
+    const state = restored.getState(30);
+    assert.equal(state.folderScan.status, FOLDER_SCAN_STATUSES.COLLECTING);
+    assert.equal(state.folderScan.currentFileId, "BBB");
+    assert.equal(state.videos.length, 1);
+    assert.deepEqual(state.selectedVideoIds, []);
+});
+
+test("resetting the folder scan does not require a separate collection reset", () => {
+    const manager = createTabStateManager();
+    manager.enableTab(31);
+    manager.addOrUpdateVideo(31, videoFixture("video-a"));
+    manager.updateFolderScan(31, { id: "scan-2", status: FOLDER_SCAN_STATUSES.COMPLETED });
+    manager.resetFolderScan(31);
+    assert.equal(manager.getState(31).folderScan.status, FOLDER_SCAN_STATUSES.IDLE);
+    assert.equal(manager.getVideosForTab(31).length, 1);
 });
