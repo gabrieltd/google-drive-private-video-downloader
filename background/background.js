@@ -1,4 +1,4 @@
-import { parseDriveVideoResponse } from "../lib/drive-parser.js";
+import { enrichParsedVideoSource, parseDriveVideoResponse } from "../lib/drive-parser.js";
 import { MESSAGE_TYPES } from "../lib/messages.js";
 import { createTabStateManager } from "../lib/tab-state.js";
 import {
@@ -22,11 +22,8 @@ import {
     isGoogleDriveUrl,
     extractDriveFileIdFromUrl,
     extractDriveFolderId,
-    extractDriveMediaFileId,
     extractDrivePlaybackFileId,
-    isDriveAudioMediaRequest,
     isGoogleDriveFolderUrl,
-    isPotentialDriveMediaRequest,
     isPotentialDrivePlaybackRequest,
     shouldAttachDebugger,
 } from "../lib/url-utils.js";
@@ -554,23 +551,6 @@ async function handleFolderCandidateTimeout(tabId, scanId, fileId) {
     if (failed) requestFolderAdvance(tabId, scanId);
 }
 
-async function handleFolderAudioMediaRequest(tabId, url) {
-    if (!isDriveAudioMediaRequest(url)) return false;
-
-    const scan = tabState.getFolderScan(tabId);
-    if (scan.status !== FOLDER_SCAN_STATUSES.COLLECTING || !scan.currentFileId) return false;
-    if (extractDriveMediaFileId(url) !== scan.currentFileId) return false;
-
-    const failed = await failFolderCandidate(
-        tabId,
-        scan.id,
-        scan.currentFileId,
-        "Drive is serving separate video and audio streams. This V1 supports directly downloadable progressive streams only.",
-    );
-    if (failed) requestFolderAdvance(tabId, scan.id);
-    return failed;
-}
-
 async function handleFolderVideoCapture(tabId, video, playbackFileId, responseCreatedAt = null) {
     const scan = tabState.getFolderScan(tabId);
     if (scan.status !== FOLDER_SCAN_STATUSES.COLLECTING || !scan.currentFileId) return false;
@@ -829,11 +809,19 @@ async function processResponse(tabId, requestId, request) {
         try {
             data = JSON.parse(body);
         } catch {
-            debugLog("Ignored non-JSON playback response", request.url);
+            let requestPath = null;
+            try {
+                const requestUrl = new URL(request.url);
+                requestPath = { host: requestUrl.hostname, pathname: requestUrl.pathname };
+            } catch {
+                requestPath = { host: null, pathname: null };
+            }
+            debugLog("Ignored non-JSON playback response", requestPath);
             return;
         }
 
-        const parsedVideo = parseDriveVideoResponse(data);
+        const playbackFileId = extractDrivePlaybackFileId(request.url);
+        const parsedVideo = enrichParsedVideoSource(parseDriveVideoResponse(data), playbackFileId);
         if (!parsedVideo || !tabState.isTabEnabled(tabId)) return;
 
         const video = createVideoRecord(parsedVideo, tabId);
@@ -848,12 +836,28 @@ async function processResponse(tabId, requestId, request) {
             );
         }
 
-        await handleFolderVideoCapture(
+        const scanBeforeCapture = tabState.getFolderScan(tabId);
+        const currentCandidate = scanBeforeCapture.candidates.find(
+            (candidate) => candidate.fileId === scanBeforeCapture.currentFileId,
+        );
+        const matched = currentCandidate
+            ? candidateMatchesVideo(currentCandidate, resultForVideo.video, playbackFileId)
+            : false;
+        const capturedForFolder = await handleFolderVideoCapture(
             tabId,
             resultForVideo.video,
-            extractDrivePlaybackFileId(request.url),
+            playbackFileId,
             request.createdAt,
         );
+        if (scanBeforeCapture.status === FOLDER_SCAN_STATUSES.COLLECTING) {
+            debugLog("Folder playback response", {
+                currentCandidateFileId: scanBeforeCapture.currentFileId,
+                playbackFileId,
+                matched,
+                progressiveFormats: resultForVideo.video.formats.filter((format) => format.progressive).length,
+                capturedForFolder,
+            });
+        }
     });
 }
 
@@ -863,10 +867,6 @@ async function handleDebuggerEvent(debuggeeId, method, params) {
 
     if (method === "Network.requestWillBeSent") {
         const url = params?.request?.url;
-        if (isPotentialDriveMediaRequest(url)) {
-            await handleFolderAudioMediaRequest(tabId, url);
-            return;
-        }
         if (!isPotentialDrivePlaybackRequest(url)) return;
         removeExpiredRequests(tabId);
         pendingRequests.set(requestKey(tabId, params.requestId), { tabId, url, createdAt: Date.now() });

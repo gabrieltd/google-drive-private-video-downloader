@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { parseDriveVideoResponse } from "../lib/drive-parser.js";
+import { enrichParsedVideoSource, parseDriveVideoResponse } from "../lib/drive-parser.js";
 import { selectBestProgressiveFormat } from "../lib/video-model.js";
 
 const progressive = (itag, height) => ({
@@ -53,6 +53,27 @@ test("preserves all stable IDs needed to correlate a playback response", () => {
     });
 });
 
+test("enriches missing source metadata from the playback URL without overwriting valid IDs", () => {
+    const parsedVideo = {
+        title: "Fixture video",
+        formats: [progressive(22, 720)],
+        sourceMetadata: {
+            fileId: null,
+            driveId: null,
+            videoId: null,
+            stableSourceKey: "fallback:fixture video|https://example.test/video/22",
+        },
+    };
+
+    const enriched = enrichParsedVideoSource(parsedVideo, "XYZ");
+    assert.equal(enriched.sourceMetadata.fileId, "XYZ");
+    assert.equal(enriched.sourceMetadata.stableSourceKey, "source:XYZ");
+    assert.equal(
+        enrichParsedVideoSource({ sourceMetadata: { fileId: "known" } }, "XYZ").sourceMetadata.fileId,
+        "known",
+    );
+});
+
 test("recognizes adaptive formats but marks them as non-progressive", () => {
     const result = parseDriveVideoResponse({
         mediaStreamingData: {
@@ -63,6 +84,22 @@ test("recognizes adaptive formats but marks them as non-progressive", () => {
     });
     assert.equal(result.title, "Untitled video");
     assert.equal(result.formats[0].progressive, false);
+    assert.equal(selectBestProgressiveFormat(result.formats), null);
+});
+
+test("accepts progressive playback when adaptive formats are also present", () => {
+    const result = parseDriveVideoResponse({
+        mediaStreamingData: {
+            formatStreamingData: {
+                progressiveTranscodes: [progressive(18, 360)],
+                adaptiveTranscodes: [{ itag: 137, url: "https://example.test/adaptive", height: 1080 }],
+            },
+        },
+    });
+
+    assert.equal(result.formats.length, 2);
+    assert.equal(result.formats.filter((format) => format.progressive).length, 1);
+    assert.equal(selectBestProgressiveFormat(result.formats).itag, 18);
 });
 
 test("parses realistic transcodeMetadata fields and selects the best quality", () => {

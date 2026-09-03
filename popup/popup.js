@@ -105,7 +105,7 @@ document.addEventListener("DOMContentLoaded", () => {
     function getFolderScanMessage(scan) {
         if (!scan) return "";
         const adaptiveFailureCount = (scan.candidates ?? [])
-            .filter((candidate) => candidate.error?.includes("separate video and audio streams")).length;
+            .filter((candidate) => candidate.error?.includes("No directly downloadable progressive stream was found.")).length;
         const failureSummary = scan.failedCount
             ? ` ${scan.failedCount} failed${adaptiveFailureCount ? ` (${adaptiveFailureCount} require adaptive muxing)` : ""}`
             : "";

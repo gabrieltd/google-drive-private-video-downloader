@@ -58,6 +58,19 @@ test("matches playback only by a stable candidate or source ID", () => {
     assert.equal(candidateMatchesVideo(candidate, { sourceMetadata: {} }), false);
 });
 
+test("matches the current candidate from the playback URL when response IDs are empty", () => {
+    const video = {
+        sourceMetadata: {
+            fileId: null,
+            driveId: null,
+            videoId: null,
+        },
+    };
+
+    assert.equal(candidateMatchesVideo({ fileId: "XYZ" }, video, "XYZ"), true);
+    assert.equal(candidateMatchesVideo({ fileId: "AAA" }, video, "BBB"), false);
+});
+
 test("prefers a matching response source ID over a different playback URL ID", () => {
     const candidate = { fileId: "AAA" };
     assert.equal(candidateMatchesVideo(
@@ -69,6 +82,14 @@ test("prefers a matching response source ID over a different playback URL ID", (
         candidate,
         { sourceMetadata: { videoId: "BBB", fileId: "BBB" } },
         "session-id",
+    ), false);
+});
+
+test("does not match a prefetched playback response for another Drive file", () => {
+    assert.equal(candidateMatchesVideo(
+        { fileId: "AAA" },
+        { sourceMetadata: { fileId: "BBB" } },
+        "BBB",
     ), false);
 });
 

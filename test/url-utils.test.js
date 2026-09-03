@@ -3,12 +3,9 @@ import assert from "node:assert/strict";
 import {
     extractDriveFileIdFromUrl,
     extractDriveFolderId,
-    extractDriveMediaFileId,
     extractDrivePlaybackFileId,
-    isDriveAudioMediaRequest,
     isGoogleDriveUrl,
     isGoogleDriveFolderUrl,
-    isPotentialDriveMediaRequest,
     isPotentialDrivePlaybackRequest,
     shouldAttachDebugger,
 } from "../lib/url-utils.js";
@@ -57,14 +54,41 @@ test("extracts Drive file and playback IDs only from supported URL shapes", () =
     assert.equal(extractDrivePlaybackFileId("https://workspacevideo-pa.clients6.google.com/v1/unknown"), null);
 });
 
-test("recognizes Drive's scoped adaptive media requests without accepting arbitrary hosts", () => {
-    const audioUrl = "https://rr3---sn-2onja5-53.c.drive.google.com/videoplayback?driveid=XYZ&mime=audio%2Fmp4&itag=140";
-    const videoUrl = "https://rr3---sn-2onja5-53.c.drive.google.com/videoplayback?driveid=XYZ&mime=video%2Fmp4&itag=134";
+test("extracts the real Drive playback file ID from both supported hosts", () => {
+    assert.equal(
+        extractDrivePlaybackFileId(
+            "https://workspacevideo-pa.clients6.google.com/v1/drive/media/XYZ/playback?auditContext=forDisplay",
+        ),
+        "XYZ",
+    );
+    assert.equal(
+        extractDrivePlaybackFileId(
+            "https://content-workspacevideo-pa.googleapis.com/v1/drive/media/XYZ/playback",
+        ),
+        "XYZ",
+    );
+});
 
-    assert.equal(isPotentialDriveMediaRequest(audioUrl), true);
-    assert.equal(extractDriveMediaFileId(audioUrl), "XYZ");
-    assert.equal(isDriveAudioMediaRequest(audioUrl), true);
-    assert.equal(isDriveAudioMediaRequest(videoUrl), false);
-    assert.equal(isPotentialDriveMediaRequest("https://rr3---sn-2onja5-53.c.drive.google.com.evil.example/videoplayback?driveid=XYZ"), false);
-    assert.equal(extractDriveMediaFileId("https://rr3---sn-2onja5-53.c.drive.google.com/other?driveid=XYZ"), null);
+test("ignores playback query parameters when extracting the real path ID", () => {
+    assert.equal(
+        extractDrivePlaybackFileId(
+            "https://workspacevideo-pa.clients6.google.com/v1/drive/media/XYZ/playback?auditContext=forDisplay&key=test&%24unique=value",
+        ),
+        "XYZ",
+    );
+});
+
+test("rejects incomplete or incorrectly shaped Drive playback paths", () => {
+    assert.equal(
+        extractDrivePlaybackFileId("https://workspacevideo-pa.clients6.google.com/v1/drive/media/XYZ"),
+        null,
+    );
+    assert.equal(
+        extractDrivePlaybackFileId("https://workspacevideo-pa.clients6.google.com/v1/media/XYZ/playback"),
+        null,
+    );
+    assert.equal(
+        extractDrivePlaybackFileId("https://workspacevideo-pa.clients6.google.com/v1/drive/media/"),
+        null,
+    );
 });

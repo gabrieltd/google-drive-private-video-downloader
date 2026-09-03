@@ -43,7 +43,7 @@ No build step is required. `npm` is only needed to run the optional tests and li
 4. Review the accumulated videos and their checkboxes.
 5. Use **Download selected** after deselecting anything you do not want to download.
 
-Folder scanning discovers only video files directly inside the current folder. It does not traverse subfolders, use the Drive API, or download files automatically. Capture is enabled automatically for the scan without reloading the folder first. If a video times out or Drive exposes separate audio and video streams, it is marked as failed and can be retried explicitly; the latter requires adaptive-stream muxing, which is outside V1.
+Folder scanning discovers only video files directly inside the current folder. It does not traverse subfolders, use the Drive API, or download files automatically. Capture is enabled automatically for the scan without reloading the folder first. If playback times out or its metadata contains no directly downloadable progressive stream, the candidate is marked as failed and can be retried explicitly; adaptive-only playback requires stream muxing, which is outside V1.
 
 For a manual V1 check, test a small mixed folder, a folder with more files than the visible viewport, a folder with no videos, cancellation during discovery or collection, retrying a failed video, switching away from and back to the Drive tab, reopening the popup while a scan continues, and downloading a manually reduced selection.
 
