@@ -5,11 +5,13 @@ A small Chromium Manifest V3 extension that downloads progressive video streams 
 ## Features
 
 - Capture is enabled independently per Google Drive tab.
+- Detected videos accumulate for the lifetime of the Drive tab's session, including across previews and reloads.
 - Detects multiple progressive qualities and lets you choose one.
+- New videos are selected by default; selection is persisted per tab and can be downloaded with **Download selected**.
 - Selects the best progressive format by resolution, width, frame rate, bitrate, and size.
 - Deduplicates repeated Drive responses and merges newly discovered formats.
 - Tracks download, completion, and interruption states.
-- Limits `Download All` to three download starts at a time.
+- Limits `Download selected` to three download starts at a time.
 - Shows the number of detected videos on the toolbar badge.
 - Uses event-driven updates; neither the background nor the popup polls for changes.
 - Keeps streaming URLs and temporary state in the current browser session only.
@@ -29,9 +31,10 @@ No build step is required. `npm` is only needed to run the optional tests and li
 2. Open the extension popup and click **ON** for that tab.
 3. The tab is reloaded once when capture is first enabled so playback requests can be observed from the beginning.
 4. Play or open the video preview. Detected videos appear in the popup and the badge count is updated.
-5. Choose **Best** to automatically use the highest-quality progressive format, choose a specific quality if preferred, and click **Download**. **Download All** also chooses Best independently for each video.
+5. Choose **Best** to automatically use the highest-quality progressive format, choose a specific quality if preferred, and click **Download**.
+6. Use **Select all**, individual checkboxes, **Clear list**, and **Download selected** to manage the accumulated collection. Batch downloads choose Best independently for each selected video.
 
-Capture can be turned off independently in each tab. The reload button reloads the current Drive tab; it does not restart the extension.
+Capture can be turned off independently in each tab without deleting its collection. The reload button reloads the current Drive tab; it does not restart the extension. The debugger is attached only while an enabled Drive tab is active, and is detached when you switch to another tab; returning to Drive reattaches it without an automatic reload.
 
 ## How it works
 
@@ -66,6 +69,7 @@ There is no `<all_urls>` host permission. The extension does not use the Google 
 - Google Drive uses internal playback APIs and their endpoints or response structures may change.
 - Only progressive streams can currently be downloaded directly. Adaptive-only streams are recognized but are not muxed because this extension does not include FFmpeg or another media pipeline.
 - Captured signed URLs may expire. Reload the Drive video and capture a fresh URL if a download is interrupted.
+- Chrome may display its debugger warning while an active debugger session exists; the extension minimizes this by detaching from inactive Drive tabs.
 - The current browser session must already be authorized to view and play the video.
 - The extension does not bypass access controls or download content unavailable to the active Google account.
 

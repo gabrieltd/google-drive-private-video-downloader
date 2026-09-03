@@ -37,9 +37,19 @@
         <div id="only-in-drive-message" class="hidden">Open a Google Drive video or preview to use this extension.</div>
         <div class="download-toolbar">
             <div id="status-message" class="hidden" role="status"></div>
-            <button id="download-all" class="download-all hidden">Download All</button>
+        </div>
+        <div id="selection-toolbar" class="selection-toolbar hidden">
+            <label class="select-all-label" for="select-all">
+                <input id="select-all" type="checkbox" />
+                <span>Select all</span>
+            </label>
+            <span id="selection-count">0 of 0 selected</span>
         </div>
         <div id="download-container" class="hidden"></div>
+        <div id="collection-actions" class="collection-actions hidden">
+            <button id="clear-list" class="secondary-button">Clear list</button>
+            <button id="download-selected" class="download-selected" disabled>Download selected (0)</button>
+        </div>
 
         <footer>
             <a

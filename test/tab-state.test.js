@@ -126,3 +126,98 @@ test("download associations survive persist and service-worker hydration", async
         video: restored.getVideosForTab(9)[0],
     });
 });
+
+function videoFixture(id, title = id) {
+    return {
+        id,
+        tabId: 20,
+        title,
+        capturedAt: 1,
+        formats: [{ itag: 22, url: `https://example.test/${id}`, progressive: true }],
+        sourceMetadata: { videoId: id },
+        identityKey: `source:${id}`,
+        download: null,
+    };
+}
+
+test("collector accumulates videos and selects new videos by default", () => {
+    const manager = createTabStateManager();
+    manager.enableTab(20);
+    manager.addOrUpdateVideo(20, videoFixture("video-a"));
+    manager.addOrUpdateVideo(20, videoFixture("video-b"));
+    manager.addOrUpdateVideo(20, videoFixture("video-c"));
+
+    assert.equal(manager.getVideosForTab(20).length, 3);
+    assert.deepEqual(manager.getSelectedVideoIds(20), ["video-a", "video-b", "video-c"]);
+});
+
+test("video updates preserve an intentional deselection", () => {
+    const manager = createTabStateManager();
+    manager.enableTab(20);
+    manager.addOrUpdateVideo(20, videoFixture("video-a"));
+    manager.addOrUpdateVideo(20, videoFixture("video-b"));
+    manager.setSelectedVideoIds(20, ["video-b"]);
+
+    manager.addOrUpdateVideo(20, {
+        ...videoFixture("video-a"),
+        formats: [{ itag: 22, url: "https://example.test/video-a?token=fresh", progressive: true }],
+    });
+
+    assert.deepEqual(manager.getSelectedVideoIds(20), ["video-b"]);
+    assert.equal(manager.getVideosForTab(20)[0].formats[0].url, "https://example.test/video-a?token=fresh");
+});
+
+test("selection is validated, persisted, and restored independently from videos", async () => {
+    let stored = {};
+    const storage = {
+        async get(key) { return { [key]: stored[key] }; },
+        async set(value) { stored = { ...stored, ...value }; },
+    };
+    const manager = createTabStateManager({ storage });
+    manager.enableTab(20);
+    manager.addOrUpdateVideo(20, videoFixture("video-a"));
+    manager.addOrUpdateVideo(20, videoFixture("video-b"));
+    manager.setSelectedVideoIds(20, ["video-a", "fake-id"]);
+    await manager.persist();
+
+    const restored = createTabStateManager({ storage });
+    await restored.hydrate();
+    assert.deepEqual(restored.getSelectedVideoIds(20), ["video-a"]);
+});
+
+test("download selection only returns videos belonging to the tab", () => {
+    const manager = createTabStateManager();
+    manager.enableTab(20);
+    manager.addOrUpdateVideo(20, videoFixture("video-a"));
+    manager.addOrUpdateVideo(20, videoFixture("video-b"));
+
+    assert.deepEqual(
+        manager.getVideosByIds(20, ["video-a", "fake-video-id"]).map((video) => video.id),
+        ["video-a"],
+    );
+});
+
+test("clear list removes videos and selection without disabling capture", () => {
+    const manager = createTabStateManager();
+    manager.enableTab(20);
+    manager.addOrUpdateVideo(20, videoFixture("video-a"));
+    manager.setSelectedVideoIds(20, []);
+    manager.clearTabVideos(20);
+
+    assert.equal(manager.getState(20).enabled, true);
+    assert.deepEqual(manager.getVideosForTab(20), []);
+    assert.deepEqual(manager.getSelectedVideoIds(20), []);
+});
+
+test("turning capture off preserves collection and selection", () => {
+    const manager = createTabStateManager();
+    manager.enableTab(20);
+    manager.addOrUpdateVideo(20, videoFixture("video-a"));
+    manager.addOrUpdateVideo(20, videoFixture("video-b"));
+    manager.setSelectedVideoIds(20, ["video-a"]);
+    manager.disableTab(20);
+
+    assert.equal(manager.getState(20).enabled, false);
+    assert.equal(manager.getVideosForTab(20).length, 2);
+    assert.deepEqual(manager.getSelectedVideoIds(20), ["video-a"]);
+});

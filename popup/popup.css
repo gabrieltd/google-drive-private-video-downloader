@@ -21,7 +21,9 @@ body {
 
 .header,
 .download-toolbar,
-.video-item {
+.video-item,
+.selection-toolbar,
+.collection-actions {
     display: flex;
     align-items: center;
     justify-content: space-between;
@@ -66,7 +68,7 @@ body {
 }
 
 .state-button,
-.download-all,
+.download-selected,
 .download-button,
 .quality-selector {
     border: 0;
@@ -83,7 +85,7 @@ body {
 
 .state-button:disabled,
 .download-button:disabled,
-.download-all:disabled {
+.download-selected:disabled {
     cursor: not-allowed;
     opacity: 0.6;
 }
@@ -123,6 +125,33 @@ body {
     gap: 0.75rem;
 }
 
+.selection-toolbar {
+    margin-bottom: 0.75rem;
+    padding: 0.4rem 0.5rem;
+    border-radius: 0.25rem;
+    background: #3a3a3a;
+    font-size: 0.75rem;
+}
+
+.select-all-label {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    cursor: pointer;
+}
+
+.video-checkbox,
+#select-all {
+    width: 1rem;
+    height: 1rem;
+    accent-color: #4caf50;
+    cursor: pointer;
+}
+
+.video-checkbox {
+    flex: 0 0 auto;
+}
+
 #status-message {
     flex: 1;
     margin-block: 0.75rem;
@@ -134,7 +163,7 @@ body {
     color: #ff9999;
 }
 
-.download-all {
+.download-selected {
     padding: 0.4rem 0.75rem;
     background: #666;
     color: #fff;
@@ -178,6 +207,26 @@ body {
 .video-controls {
     justify-content: flex-end;
     flex-wrap: wrap;
+}
+
+.collection-actions {
+    gap: 0.75rem;
+    margin-top: 0.75rem;
+}
+
+.secondary-button {
+    padding: 0.4rem 0.75rem;
+    border: 0;
+    border-radius: 0.25rem;
+    background: #555;
+    color: #fff;
+    cursor: pointer;
+    font-size: 0.75rem;
+}
+
+.secondary-button:disabled {
+    cursor: not-allowed;
+    opacity: 0.6;
 }
 
 .quality-selector {

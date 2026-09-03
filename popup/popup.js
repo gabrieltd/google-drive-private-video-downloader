@@ -10,11 +10,17 @@ document.addEventListener("DOMContentLoaded", () => {
     const btnOn = document.getElementById("button-on");
     const btnOff = document.getElementById("button-off");
     const reloadBtn = document.querySelector(".reload-button");
-    const downloadAllBtn = document.getElementById("download-all");
+    const selectionToolbar = document.getElementById("selection-toolbar");
+    const selectAllCheckbox = document.getElementById("select-all");
+    const selectionCount = document.getElementById("selection-count");
+    const collectionActions = document.getElementById("collection-actions");
+    const clearListButton = document.getElementById("clear-list");
+    const downloadSelectedButton = document.getElementById("download-selected");
 
     let activeTabId = null;
     let currentState = null;
     let currentVideos = [];
+    let selectedVideoIds = new Set();
 
     function sendMessage(message) {
         return new Promise((resolve, reject) => {
@@ -58,12 +64,65 @@ document.addEventListener("DOMContentLoaded", () => {
         return 0;
     }
 
+    function selectionForVideos(state, videos) {
+        const validIds = new Set(videos.map((video) => video.id));
+        return new Set((state?.selectedVideoIds ?? []).filter((id) => validIds.has(id)));
+    }
+
+    function updateSelectionControls(videos) {
+        const total = videos.length;
+        const selected = selectedVideoIds.size;
+        selectAllCheckbox.checked = total > 0 && selected === total;
+        selectAllCheckbox.indeterminate = selected > 0 && selected < total;
+        selectAllCheckbox.disabled = total === 0;
+        selectionCount.textContent = `${selected} of ${total} selected`;
+        downloadSelectedButton.textContent = `Download selected (${selected})`;
+        downloadSelectedButton.disabled = selected === 0;
+        clearListButton.disabled = total === 0;
+        selectionToolbar.classList.toggle("hidden", total === 0);
+    }
+
+    async function persistSelection(nextSelection) {
+        const previousState = currentState;
+        const previousSelection = [...selectedVideoIds];
+        selectedVideoIds = new Set(nextSelection);
+        currentState = { ...(currentState ?? {}), selectedVideoIds: [...selectedVideoIds] };
+        render(currentState, currentVideos);
+
+        try {
+            const response = await sendMessage({
+                type: MESSAGE_TYPES.SET_SELECTION,
+                tabId: activeTabId,
+                selectedVideoIds: [...selectedVideoIds],
+            });
+            if (!response?.success) throw new Error(response?.error ?? "Unable to save selection.");
+            render(response.state, response.videos ?? currentVideos);
+        } catch (error) {
+            selectedVideoIds = new Set(previousSelection);
+            currentState = previousState;
+            render(currentState, currentVideos);
+            setStatus(error.message, true);
+        }
+    }
+
     function renderVideo(video) {
         const item = document.createElement("div");
         item.className = "video-item";
 
         const info = document.createElement("div");
         info.className = "video-info";
+
+        const checkbox = document.createElement("input");
+        checkbox.className = "video-checkbox";
+        checkbox.type = "checkbox";
+        checkbox.checked = selectedVideoIds.has(video.id);
+        checkbox.setAttribute("aria-label", `Select ${video.title}`);
+        checkbox.addEventListener("change", () => {
+            const nextSelection = new Set(selectedVideoIds);
+            if (checkbox.checked) nextSelection.add(video.id);
+            else nextSelection.delete(video.id);
+            void persistSelection([...nextSelection]);
+        });
 
         const title = document.createElement("span");
         title.className = "video-title";
@@ -139,13 +198,14 @@ document.addEventListener("DOMContentLoaded", () => {
         }
         controls.appendChild(downloadButton);
 
-        item.append(info, controls);
+        item.append(checkbox, info, controls);
         return item;
     }
 
     function render(state, videos) {
         currentState = state;
         currentVideos = videos;
+        selectedVideoIds = selectionForVideos(state, videos);
         updateButtons(state);
         downloadContainer.replaceChildren();
 
@@ -155,15 +215,16 @@ document.addEventListener("DOMContentLoaded", () => {
         } else if (downloadError) {
             setStatus(downloadError, true);
         } else if (!state?.enabled) {
-            setStatus("Click ON to start capture.");
+            setStatus(videos.length > 0 ? "Capture is off. Existing collection is available." : "Click ON to start capture.");
         } else if (videos.length === 0) {
             setStatus("Waiting for a Google Drive video… Open or play a video preview to detect available streams.");
         } else {
-            setStatus(state.debuggerAttached ? "Capturing" : "Capture is paused.");
+            setStatus(state.debuggerAttached
+                ? "Capturing"
+                : "Capture is enabled. Return to this Drive tab to resume detection.");
         }
 
-        const hasDownloadableVideo = videos.some((video) => (video.formats ?? []).some((format) => format.progressive));
-        downloadAllBtn.classList.toggle("hidden", !hasDownloadableVideo);
+        updateSelectionControls(videos);
         for (const video of videos) downloadContainer.appendChild(renderVideo(video));
     }
 
@@ -172,7 +233,8 @@ document.addEventListener("DOMContentLoaded", () => {
         downloadContainer.classList.toggle("hidden", !isDrive);
         statusMessage.classList.toggle("hidden", !isDrive);
         notDriveMessage.classList.toggle("hidden", isDrive);
-        downloadAllBtn.classList.toggle("hidden", !isDrive);
+        collectionActions.classList.toggle("hidden", !isDrive);
+        selectionToolbar.classList.toggle("hidden", !isDrive || currentVideos.length === 0);
     }
 
     async function refreshState() {
@@ -213,21 +275,43 @@ document.addEventListener("DOMContentLoaded", () => {
     reloadBtn.addEventListener("click", () => {
         if (activeTabId !== null) chrome.tabs.reload(activeTabId);
     });
-    downloadAllBtn.addEventListener("click", async () => {
-        downloadAllBtn.disabled = true;
+    selectAllCheckbox.addEventListener("change", () => {
+        const nextSelection = selectAllCheckbox.checked
+            ? currentVideos.map((video) => video.id)
+            : [];
+        void persistSelection(nextSelection);
+    });
+    clearListButton.addEventListener("click", async () => {
+        clearListButton.disabled = true;
         try {
-            const response = await sendMessage({ type: MESSAGE_TYPES.DOWNLOAD_ALL, tabId: activeTabId });
-            if (!response?.success) setStatus("No video could be queued for download.", true);
+            const response = await sendMessage({ type: MESSAGE_TYPES.CLEAR_VIDEOS, tabId: activeTabId });
+            if (!response?.success) throw new Error(response?.error ?? "Unable to clear the collection.");
+            render(response.state, response.videos ?? []);
+        } catch (error) {
+            setStatus(error.message, true);
+        }
+    });
+    downloadSelectedButton.addEventListener("click", async () => {
+        if (selectedVideoIds.size === 0) return;
+        downloadSelectedButton.disabled = true;
+        try {
+            const response = await sendMessage({
+                type: MESSAGE_TYPES.DOWNLOAD_SELECTED,
+                tabId: activeTabId,
+                videoIds: [...selectedVideoIds],
+            });
+            if (!response?.success) setStatus("No selected video could be queued for download.", true);
         } catch (error) {
             setStatus(error.message, true);
         } finally {
-            downloadAllBtn.disabled = false;
+            updateSelectionControls(currentVideos);
         }
     });
 
     chrome.runtime.onMessage.addListener((message) => {
         if (!message || message.tabId !== activeTabId) return;
         if (message.type === MESSAGE_TYPES.VIDEO_DETECTED || message.type === MESSAGE_TYPES.VIDEO_UPDATED) {
+            currentState = message.state ?? currentState;
             const index = currentVideos.findIndex((video) => video.id === message.video?.id);
             if (index === -1) currentVideos = [...currentVideos, message.video];
             else currentVideos = currentVideos.map((video, videoIndex) => videoIndex === index ? message.video : video);
@@ -239,7 +323,7 @@ document.addEventListener("DOMContentLoaded", () => {
             render(currentState, currentVideos);
         } else if (message.type === MESSAGE_TYPES.TAB_STATE_CHANGED) {
             currentState = message.state;
-            if (!currentState.enabled) currentVideos = [];
+            currentVideos = message.state?.videos ?? currentVideos;
             render(currentState, currentVideos);
         }
     });

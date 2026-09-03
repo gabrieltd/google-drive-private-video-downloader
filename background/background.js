@@ -7,7 +7,11 @@ import {
     sanitizeFilename,
     selectBestProgressiveFormat,
 } from "../lib/video-model.js";
-import { isGoogleDriveUrl, isPotentialDrivePlaybackRequest } from "../lib/url-utils.js";
+import {
+    isGoogleDriveUrl,
+    isPotentialDrivePlaybackRequest,
+    shouldAttachDebugger,
+} from "../lib/url-utils.js";
 
 const DEBUG = false;
 const SESSION_STORAGE_KEY = "tabStates";
@@ -19,6 +23,8 @@ const captureOperations = new Map();
 const pendingRequests = new Map();
 const downloadById = new Map();
 const cleanupTabs = new Set();
+const expectedDetachTabs = new Set();
+const expectedDetachTimers = new Map();
 const lastDetachAt = new Map();
 
 function debugLog(...args) {
@@ -77,6 +83,24 @@ function requestKey(tabId, requestId) {
     return `${tabId}:${requestId}`;
 }
 
+function markExpectedDetach(tabId) {
+    expectedDetachTabs.add(tabId);
+    const previousTimer = expectedDetachTimers.get(tabId);
+    if (previousTimer) clearTimeout(previousTimer);
+    const timer = setTimeout(() => {
+        expectedDetachTabs.delete(tabId);
+        expectedDetachTimers.delete(tabId);
+    }, 1000);
+    expectedDetachTimers.set(tabId, timer);
+}
+
+function clearExpectedDetach(tabId) {
+    expectedDetachTabs.delete(tabId);
+    const timer = expectedDetachTimers.get(tabId);
+    if (timer) clearTimeout(timer);
+    expectedDetachTimers.delete(tabId);
+}
+
 function sendRuntimeEvent(message) {
     try {
         chrome.runtime.sendMessage(message, () => {
@@ -100,6 +124,15 @@ async function updateBadge(tabId) {
 
 function notifyTabState(tabId) {
     sendRuntimeEvent({ type: MESSAGE_TYPES.TAB_STATE_CHANGED, tabId, state: stateFor(tabId) });
+}
+
+function notifyVideoChange(tabId, type, video) {
+    sendRuntimeEvent({
+        type,
+        tabId,
+        video,
+        state: stateFor(tabId),
+    });
 }
 
 function notifyDownload(tabId, video) {
@@ -208,12 +241,55 @@ async function disableCapture(tabId) {
     return operationForTab(tabId, async () => {
         tabState.disableTab(tabId);
         await cleanupTabResourcesInternal(tabId, {
-            clearVideos: true,
-            removeState: true,
+            clearVideos: false,
+            removeState: false,
             forceDetach: true,
         });
         return true;
     });
+}
+
+async function leaveDriveInternal(tabId) {
+    tabState.disableTab(tabId);
+    await cleanupTabResourcesInternal(tabId, {
+        clearVideos: true,
+        removeState: true,
+        forceDetach: true,
+    });
+    return true;
+}
+
+async function leaveDrive(tabId) {
+    return operationForTab(tabId, () => leaveDriveInternal(tabId));
+}
+
+async function detachInactiveTabInternal(tabId) {
+    if (!tabState.isTabEnabled(tabId)) return false;
+    const state = stateFor(tabId);
+    if (!state.debuggerAttached) return false;
+
+    markExpectedDetach(tabId);
+    let detachError = false;
+    try {
+        await detachDebugger(tabId);
+    } catch (error) {
+        if (!isExpectedDetachError(error)) {
+            detachError = true;
+            tabState.setLastError(tabId, `Unable to detach debugger. ${error.message}`);
+            console.error("Unable to detach inactive debugger", error);
+        }
+        clearExpectedDetach(tabId);
+    }
+    tabState.setDebuggerAttached(tabId, false);
+    if (!detachError) tabState.setLastError(tabId, null);
+    removePendingRequests(tabId);
+    await tabState.persist();
+    notifyTabState(tabId);
+    return true;
+}
+
+async function detachInactiveTab(tabId) {
+    return operationForTab(tabId, () => detachInactiveTabInternal(tabId));
 }
 
 async function startCapture(tabId) {
@@ -222,7 +298,11 @@ async function startCapture(tabId) {
 
         const tab = await chromeCall(chrome.tabs.get.bind(chrome.tabs), tabId).catch(() => null);
         if (!isGoogleDriveUrl(tab?.url)) {
-            await cleanupTabResourcesInternal(tabId, { clearVideos: true, removeState: true });
+            await leaveDriveInternal(tabId);
+            return false;
+        }
+        if (!shouldAttachDebugger(tab, true)) {
+            if (stateFor(tabId).debuggerAttached) await detachInactiveTabInternal(tabId);
             return false;
         }
 
@@ -290,11 +370,11 @@ async function processResponse(tabId, requestId, request) {
 
         await tabState.persist();
         await updateBadge(tabId);
-        sendRuntimeEvent({
-            type: resultForVideo.isNew ? MESSAGE_TYPES.VIDEO_DETECTED : MESSAGE_TYPES.VIDEO_UPDATED,
+        notifyVideoChange(
             tabId,
-            video: resultForVideo.video,
-        });
+            resultForVideo.isNew ? MESSAGE_TYPES.VIDEO_DETECTED : MESSAGE_TYPES.VIDEO_UPDATED,
+            resultForVideo.video,
+        );
     });
 }
 
@@ -385,12 +465,28 @@ async function handleDownloadChange(downloadId, delta) {
     notifyDownload(association.tabId, video);
 }
 
+async function downloadVideos(tabId, videoIds) {
+    const videos = tabState.getVideosByIds(tabId, videoIds);
+    const tasks = videos.map((video) => async () => {
+        if (video.download?.status === "downloading") {
+            return { videoId: video.id, success: true, skipped: true };
+        }
+        return { videoId: video.id, ...(await startDownload(tabId, video.id)) };
+    });
+    const results = await runWithConcurrency(tasks, 3);
+    return { success: results.some((result) => result.success), results };
+}
+
 async function handleMessage(message, sender) {
     if (!message || !message.type) return { success: false, error: "Invalid message." };
     const tabId = Number.isInteger(message.tabId) ? message.tabId : sender?.tab?.id;
 
     if (message.type === MESSAGE_TYPES.GET_TAB_STATE) {
         if (!Number.isInteger(tabId)) return { success: false, error: "No active tab." };
+        const tab = await chromeCall(chrome.tabs.get.bind(chrome.tabs), tabId).catch(() => null);
+        if (tab?.active && isGoogleDriveUrl(tab.url) && tabState.isTabEnabled(tabId)) {
+            await startCapture(tabId);
+        }
         return { success: true, state: stateFor(tabId), videos: tabState.getVideosForTab(tabId) };
     }
 
@@ -403,7 +499,7 @@ async function handleMessage(message, sender) {
 
         if (!message.enabled) {
             await disableCapture(tabId);
-            return { success: true, state: stateFor(tabId), videos: [] };
+            return { success: true, state: stateFor(tabId), videos: tabState.getVideosForTab(tabId) };
         }
 
         const wasEnabled = tabState.isTabEnabled(tabId);
@@ -424,22 +520,41 @@ async function handleMessage(message, sender) {
         };
     }
 
+    if (message.type === MESSAGE_TYPES.SET_SELECTION) {
+        if (!Number.isInteger(tabId)) return { success: false, error: "No active tab." };
+        const result = await operationForTab(tabId, async () => {
+            const selection = tabState.setSelectedVideoIds(tabId, message.selectedVideoIds);
+            await tabState.persist();
+            notifyTabState(tabId);
+            return selection;
+        });
+        return {
+            success: true,
+            selectedVideoIds: result.selectedVideoIds,
+            state: stateFor(tabId),
+            videos: tabState.getVideosForTab(tabId),
+        };
+    }
+
+    if (message.type === MESSAGE_TYPES.CLEAR_VIDEOS) {
+        if (!Number.isInteger(tabId)) return { success: false, error: "No active tab." };
+        await operationForTab(tabId, async () => {
+            tabState.clearTabVideos(tabId);
+            await tabState.persist();
+            await updateBadge(tabId);
+            notifyTabState(tabId);
+        });
+        return { success: true, state: stateFor(tabId), videos: [] };
+    }
+
     if (message.type === MESSAGE_TYPES.DOWNLOAD_VIDEO) {
         if (!Number.isInteger(tabId)) return { success: false, error: "No active tab." };
         return startDownload(tabId, message.videoId, message.formatId ?? null, message.formatKey ?? null);
     }
 
-    if (message.type === MESSAGE_TYPES.DOWNLOAD_ALL) {
+    if (message.type === MESSAGE_TYPES.DOWNLOAD_SELECTED) {
         if (!Number.isInteger(tabId)) return { success: false, error: "No active tab." };
-        const videos = tabState.getVideosForTab(tabId);
-        const tasks = videos.map((video) => async () => {
-            if (video.download?.status === "downloading") {
-                return { videoId: video.id, success: true, skipped: true };
-            }
-            return { videoId: video.id, ...(await startDownload(tabId, video.id)) };
-        });
-        const results = await runWithConcurrency(tasks, 3);
-        return { success: results.some((result) => result.success), results };
+        return downloadVideos(tabId, message.videoIds);
     }
 
     return { success: false, error: "Unknown message type." };
@@ -449,11 +564,6 @@ async function initialize() {
     await tabState.hydrate();
     let changed = false;
     for (const state of tabState.getAllStates()) {
-        if (!state.enabled) {
-            tabState.removeTab(state.tabId);
-            changed = true;
-            continue;
-        }
         const tab = await chromeCall(chrome.tabs.get.bind(chrome.tabs), state.tabId).catch(() => null);
         if (!tab || !isGoogleDriveUrl(tab.url)) {
             tabState.removeTab(state.tabId);
@@ -470,6 +580,23 @@ ready.then(() => {
         if (state.enabled) void startCapture(state.tabId);
     }
 });
+
+async function handleTabActivated(activeInfo) {
+    const activeTab = await chromeCall(chrome.tabs.get.bind(chrome.tabs), activeInfo.tabId).catch(() => null);
+    const states = tabState.getAllStates();
+
+    for (const state of states) {
+        if (!state.enabled || state.tabId === activeInfo.tabId || !state.debuggerAttached) continue;
+        const tab = await chromeCall(chrome.tabs.get.bind(chrome.tabs), state.tabId).catch(() => null);
+        if (tab?.windowId === activeInfo.windowId && isGoogleDriveUrl(tab.url)) {
+            await detachInactiveTab(state.tabId);
+        }
+    }
+
+    if (activeTab && isGoogleDriveUrl(activeTab.url) && tabState.isTabEnabled(activeInfo.tabId)) {
+        await startCapture(activeInfo.tabId);
+    }
+}
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     void ready
@@ -494,8 +621,18 @@ chrome.debugger.onDetach.addListener((source, reason) => {
 
     void ready.then(() => operationForTab(tabId, async () => {
         removePendingRequests(tabId);
+        const expected = expectedDetachTabs.has(tabId);
+        if (expected) clearExpectedDetach(tabId);
         if (cleanupTabs.has(tabId) || !tabState.isTabEnabled(tabId)) return;
         tabState.setDebuggerAttached(tabId, false);
+
+        const tab = await chromeCall(chrome.tabs.get.bind(chrome.tabs), tabId).catch(() => null);
+        if (expected || tab?.active !== true) {
+            tabState.setLastError(tabId, null);
+            await tabState.persist();
+            notifyTabState(tabId);
+            return;
+        }
 
         const state = stateFor(tabId);
         const external = EXTERNAL_DEBUGGER_REASONS.has(reason);
@@ -516,8 +653,8 @@ chrome.debugger.onDetach.addListener((source, reason) => {
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
     void ready.then(async () => {
         const url = changeInfo.url ?? tab?.url;
-        if (url && !isGoogleDriveUrl(url) && tabState.isTabEnabled(tabId)) {
-            await disableCapture(tabId);
+        if (url && !isGoogleDriveUrl(url) && tabState.hasTab(tabId)) {
+            await leaveDrive(tabId);
             return;
         }
 
@@ -526,19 +663,19 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
             isGoogleDriveUrl(url) &&
             tabState.isTabEnabled(tabId)
         ) {
-            await operationForTab(tabId, async () => {
-                removePendingRequests(tabId);
-                tabState.clearTabVideos(tabId);
-                await tabState.persist();
-                await updateBadge(tabId);
-                notifyTabState(tabId);
-            });
+            removePendingRequests(tabId);
         }
 
         if (changeInfo.status === "complete" && isGoogleDriveUrl(tab?.url) && tabState.isTabEnabled(tabId)) {
             await startCapture(tabId);
         }
     }).catch((error) => console.error("Tab update handling failed", error));
+});
+
+chrome.tabs.onActivated.addListener((activeInfo) => {
+    void ready.then(() => handleTabActivated(activeInfo)).catch((error) => {
+        console.error("Tab activation handling failed", error);
+    });
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {
