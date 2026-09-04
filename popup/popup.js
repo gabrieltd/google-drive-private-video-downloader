@@ -1,5 +1,5 @@
 import { MESSAGE_TYPES } from "../lib/messages.js";
-import { FOLDER_SCAN_STATUSES } from "../lib/folder-scan.js";
+import { FOLDER_SCAN_STATUSES, folderDownloadProgress } from "../lib/folder-scan.js";
 import { formatBytes, formatIdentity, selectBestProgressiveFormat } from "../lib/video-model.js";
 import { isGoogleDriveFolderUrl, isGoogleDriveUrl } from "../lib/url-utils.js";
 
@@ -55,6 +55,7 @@ document.addEventListener("DOMContentLoaded", () => {
         const scanActive = [
             FOLDER_SCAN_STATUSES.DISCOVERING,
             FOLDER_SCAN_STATUSES.COLLECTING,
+            FOLDER_SCAN_STATUSES.DOWNLOADING,
             FOLDER_SCAN_STATUSES.PAUSED,
         ].includes(state?.folderScan?.status);
         btnOn.disabled = scanActive || enabled && !hasError;
@@ -96,6 +97,7 @@ document.addEventListener("DOMContentLoaded", () => {
         const scanActive = [
             FOLDER_SCAN_STATUSES.DISCOVERING,
             FOLDER_SCAN_STATUSES.COLLECTING,
+            FOLDER_SCAN_STATUSES.DOWNLOADING,
             FOLDER_SCAN_STATUSES.PAUSED,
         ].includes(currentState?.folderScan?.status);
         clearListButton.disabled = total === 0 || scanActive;
@@ -104,22 +106,31 @@ document.addEventListener("DOMContentLoaded", () => {
 
     function getFolderScanMessage(scan) {
         if (!scan) return "";
+        const downloadProgress = folderDownloadProgress(scan);
         const adaptiveFailureCount = (scan.candidates ?? [])
             .filter((candidate) => candidate.error?.includes("No directly downloadable progressive stream was found.")).length;
         const failureSummary = scan.failedCount
             ? ` ${scan.failedCount} failed${adaptiveFailureCount ? ` (${adaptiveFailureCount} require adaptive muxing)` : ""}`
             : "";
         if (scan.status === FOLDER_SCAN_STATUSES.DISCOVERING) {
-            return `Scanning folder… ${scan.discoveredCount} video candidate${scan.discoveredCount === 1 ? "" : "s"} discovered`;
+            const otherCount = scan.discoveredRegularFileCount + scan.discoveredUnsupportedCount;
+            return `Scanning folder… ${scan.discoveredCount} file${scan.discoveredCount === 1 ? "" : "s"} discovered (${scan.discoveredVideoCount} videos · ${otherCount} other${otherCount === 1 ? "" : "s"})`;
         }
         if (scan.status === FOLDER_SCAN_STATUSES.COLLECTING) {
-            return `Collecting ${scan.capturedCount} of ${scan.total} videos…${failureSummary}`;
+            const otherCount = scan.discoveredRegularFileCount + scan.discoveredUnsupportedCount;
+            return `Collecting video metadata ${scan.capturedCount} of ${scan.total} videos${otherCount ? ` · ${otherCount} other files ready` : ""}…${failureSummary}`;
         }
         if (scan.status === FOLDER_SCAN_STATUSES.PAUSED) return "Folder scan paused. Return to this Drive tab to continue.";
+        if (scan.status === FOLDER_SCAN_STATUSES.DOWNLOADING) {
+            const destination = scan.downloadDirectory ?? scan.folderName ?? "Google Drive Folder";
+            const adaptiveSummary = adaptiveFailureCount ? ` (${adaptiveFailureCount} require adaptive muxing)` : "";
+            return `Downloading folder: ${downloadProgress.completedCount} of ${downloadProgress.total} complete · ${downloadProgress.downloadingCount} downloading${downloadProgress.failedCount ? ` · ${downloadProgress.failedCount} failed${adaptiveSummary}` : ""}. Saving to: ${destination}`;
+        }
         if (scan.status === FOLDER_SCAN_STATUSES.COMPLETED) {
-            return scan.total === 0
-                ? "No video files were found in this folder."
-                : `Folder scan complete: ${scan.capturedCount} of ${scan.total} captured${failureSummary ? `,${failureSummary}` : ""}.`;
+            if (downloadProgress.total === 0) return "No downloadable files were found in this folder.";
+            const destination = scan.downloadDirectory ?? scan.folderName ?? "Google Drive Folder";
+            const adaptiveSummary = adaptiveFailureCount ? ` (${adaptiveFailureCount} require adaptive muxing)` : "";
+            return `Folder download complete: ${downloadProgress.completedCount} downloaded${downloadProgress.failedCount ? `, ${downloadProgress.failedCount} failed${adaptiveSummary}` : ""}${downloadProgress.skippedCount ? `, ${downloadProgress.skippedCount} unsupported` : ""}. Saved to: ${destination}`;
         }
         if (scan.status === FOLDER_SCAN_STATUSES.CANCELLED) return "Folder scan cancelled.";
         if (scan.status === FOLDER_SCAN_STATUSES.ERROR) return scan.error ?? "Unable to inspect this Drive folder.";
@@ -131,6 +142,7 @@ document.addEventListener("DOMContentLoaded", () => {
         const active = [
             FOLDER_SCAN_STATUSES.DISCOVERING,
             FOLDER_SCAN_STATUSES.COLLECTING,
+            FOLDER_SCAN_STATUSES.DOWNLOADING,
             FOLDER_SCAN_STATUSES.PAUSED,
         ].includes(scan?.status);
         const hasResult = scan?.status && scan.status !== FOLDER_SCAN_STATUSES.IDLE;
@@ -142,8 +154,8 @@ document.addEventListener("DOMContentLoaded", () => {
         retryFolderScanButton.classList.toggle("hidden", active || !scan?.failedCount);
         retryFolderScanButton.disabled = active || !scan?.failedCount;
         folderScanHint.textContent = isFolder
-            ? active ? "" : "Only videos directly inside this folder are scanned; subfolders are skipped."
-            : "Open a Drive folder to scan its videos.";
+            ? active ? "" : "Scans and automatically downloads all supported files directly inside this folder. Subfolders are skipped."
+            : "Open a Drive folder to scan its files.";
     }
 
     async function persistSelection(nextSelection) {
@@ -281,6 +293,7 @@ document.addEventListener("DOMContentLoaded", () => {
         } else if ([
             FOLDER_SCAN_STATUSES.DISCOVERING,
             FOLDER_SCAN_STATUSES.COLLECTING,
+            FOLDER_SCAN_STATUSES.DOWNLOADING,
             FOLDER_SCAN_STATUSES.PAUSED,
             FOLDER_SCAN_STATUSES.COMPLETED,
             FOLDER_SCAN_STATUSES.CANCELLED,

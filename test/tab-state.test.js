@@ -1,7 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createTabStateManager } from "../lib/tab-state.js";
-import { FOLDER_CANDIDATE_STATUSES, FOLDER_SCAN_STATUSES } from "../lib/folder-scan.js";
+import {
+    FOLDER_CANDIDATE_STATUSES,
+    FOLDER_DOWNLOAD_STATUSES,
+    FOLDER_SCAN_STATUSES,
+} from "../lib/folder-scan.js";
 
 test("tab state is independent and hydrates without debugger handles", async () => {
     let stored = {};
@@ -264,4 +268,71 @@ test("resetting the folder scan does not require a separate collection reset", (
     manager.resetFolderScan(31);
     assert.equal(manager.getState(31).folderScan.status, FOLDER_SCAN_STATUSES.IDLE);
     assert.equal(manager.getVideosForTab(31).length, 1);
+});
+
+test("hydrates and updates folder download items without adding regular files to videos", async () => {
+    let stored = {};
+    const storage = {
+        async get(key) { return { [key]: stored[key] }; },
+        async set(value) { stored = { ...stored, ...value }; },
+    };
+    const manager = createTabStateManager({ storage });
+    manager.enableTab(32);
+    manager.updateFolderScan(32, {
+        id: "scan-files",
+        status: FOLDER_SCAN_STATUSES.DOWNLOADING,
+        authuser: "1",
+        regularFiles: [{ fileId: "ABC", name: "guide.pdf", mimeType: "application/pdf" }],
+        downloadItems: [{
+            key: "file:ABC",
+            fileId: "ABC",
+            name: "guide.pdf",
+            kind: "file",
+            status: FOLDER_DOWNLOAD_STATUSES.DOWNLOADING,
+            downloadId: 444,
+        }],
+    });
+    await manager.persist();
+
+    const restored = createTabStateManager({ storage });
+    await restored.hydrate();
+    const state = restored.getState(32);
+    assert.equal(state.videos.length, 0);
+    assert.equal(state.folderScan.authuser, "1");
+    assert.equal(state.folderScan.regularFiles[0].name, "guide.pdf");
+    assert.equal(restored.findFolderDownloadByDownloadId(444).item.fileId, "ABC");
+
+    const updated = restored.updateFolderDownloadItem(32, "file:ABC", {
+        status: FOLDER_DOWNLOAD_STATUSES.COMPLETE,
+        error: null,
+    });
+    assert.equal(updated.status, FOLDER_DOWNLOAD_STATUSES.COMPLETE);
+    assert.equal(restored.getFolderScan(32).downloadItems[0].downloadId, 444);
+});
+
+test("hydrates old folder scan state with new defaults", async () => {
+    let stored = {
+        tabStates: {
+            "33": {
+                tabId: 33,
+                enabled: true,
+                folderScan: {
+                    id: "old-scan",
+                    status: FOLDER_SCAN_STATUSES.COLLECTING,
+                    candidates: [{ fileId: "AAA", name: "A.mp4", status: FOLDER_CANDIDATE_STATUSES.CAPTURED }],
+                },
+            },
+        },
+    };
+    const manager = createTabStateManager({
+        storage: {
+            async get(key) { return { [key]: stored[key] }; },
+            async set(value) { stored = { ...stored, ...value }; },
+        },
+    });
+    await manager.hydrate();
+    const scan = manager.getFolderScan(33);
+    assert.equal(scan.authuser, "0");
+    assert.deepEqual(scan.regularFiles, []);
+    assert.deepEqual(scan.downloadItems, []);
 });

@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
     extractDriveFileIdFromUrl,
     extractDriveFolderId,
+    extractDriveAuthUser,
     extractDrivePlaybackFileId,
     isGoogleDriveUrl,
     isGoogleDriveFolderUrl,
@@ -37,6 +38,14 @@ test("distinguishes Drive folders from file pages", () => {
     assert.equal(isGoogleDriveFolderUrl("https://drive.google.com/drive/folders/ABC"), true);
     assert.equal(isGoogleDriveFolderUrl("https://drive.google.com/file/d/XYZ/view"), false);
     assert.equal(extractDriveFolderId("https://drive.google.com/file/d/XYZ/view"), null);
+});
+
+test("extracts the Drive authuser from the explicit query before the path", () => {
+    assert.equal(extractDriveAuthUser("https://drive.google.com/drive/u/0/folders/ABC"), "0");
+    assert.equal(extractDriveAuthUser("https://drive.google.com/drive/u/1/folders/ABC"), "1");
+    assert.equal(extractDriveAuthUser("https://drive.google.com/drive/u/1/folders/ABC?authuser=2"), "2");
+    assert.equal(extractDriveAuthUser("https://drive.google.com/drive/folders/ABC"), "0");
+    assert.equal(extractDriveAuthUser("https://example.test/drive/u/1/folders/ABC"), "0");
 });
 
 test("extracts Drive file and playback IDs only from supported URL shapes", () => {
