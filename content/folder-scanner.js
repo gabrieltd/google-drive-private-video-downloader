@@ -67,7 +67,7 @@
     }
 
     function isGenericFolderLabel(value) {
-        return /^(?:folder path|folders and views|name|owner|date modified|file size)$/i.test(value);
+        return /^(?:folder path|folders and views|my drive|google drive|name|owner|date modified|file size)$/i.test(value);
     }
 
     function isDriveFolderHref(value) {
@@ -283,20 +283,37 @@
     }
 
     function folderNameFromPage() {
-        const candidateGroups = [
-            document.querySelectorAll("[role='list'][aria-label*='folder path' i] [role='button'][aria-label]"),
-            document.querySelectorAll("[aria-label*='breadcrumb' i] [aria-current], [aria-current='page']"),
-            document.querySelectorAll("[role='heading']"),
-        ];
-        for (const candidates of candidateGroups) {
-            for (const element of candidates) {
-                const name = normalizedText(element.getAttribute("aria-label")) || normalizedText(element.textContent);
-                if (name && !/google drive/i.test(name) && !isGenericFolderLabel(name) && isLikelyVideoFilename(name) === false) return name;
-            }
-        }
+        const isValidFolderName = (element) => {
+            const name = normalizedText(element.getAttribute("aria-label")) || normalizedText(element.textContent);
+            return name && !isGenericFolderLabel(name) && isLikelyVideoFilename(name) === false ? name : null;
+        };
+        const folderPath = [...document.querySelectorAll(
+            "[role='list'][aria-label*='folder path' i] [role='button'][aria-label], "
+            + "[role='list'][aria-label*='folder path' i] [aria-current]",
+        )];
+        const currentFolder = folderPath
+            .filter((element) => element.getAttribute("aria-current") === "page")
+            .map(isValidFolderName)
+            .filter(Boolean)
+            .pop();
+        if (currentFolder) return currentFolder;
+        const pathFolder = folderPath.map(isValidFolderName).filter(Boolean).pop();
+        if (pathFolder) return pathFolder;
+
+        const breadcrumb = [...document.querySelectorAll(
+            "[aria-label*='breadcrumb' i] [aria-current], [aria-label*='breadcrumb' i] [role='link']",
+        )];
+        const currentBreadcrumb = breadcrumb
+            .filter((element) => element.getAttribute("aria-current") === "page")
+            .map(isValidFolderName)
+            .filter(Boolean)
+            .pop();
+        if (currentBreadcrumb) return currentBreadcrumb;
+        const lastBreadcrumb = breadcrumb.map(isValidFolderName).filter(Boolean).pop();
+        if (lastBreadcrumb) return lastBreadcrumb;
 
         const title = normalizedText(document.title).replace(/\s*-\s*Google Drive\s*$/i, "");
-        return title || "Google Drive Folder";
+        return title && !isGenericFolderLabel(title) ? title : "Google Drive Folder";
     }
 
     function isExcludedContainer(element) {

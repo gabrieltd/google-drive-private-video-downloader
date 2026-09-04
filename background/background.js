@@ -12,6 +12,7 @@ import {
     dedupeUnsupportedDriveFiles,
     dedupeFolderCandidates,
     folderDownloadProgress,
+    getFolderDownloadQueueBatch,
     getNextPendingCandidate,
     normalizeFolderCandidate,
     updateFolderDownloadItem,
@@ -38,6 +39,8 @@ import {
     extractDriveFolderId,
     extractDrivePlaybackFileId,
     isGoogleDriveFolderUrl,
+    extractDriveFolderNameFromTitle,
+    resolveDriveFolderName,
     isPotentialDrivePlaybackRequest,
     shouldAttachDebugger,
 } from "../lib/url-utils.js";
@@ -52,6 +55,7 @@ const captureOperations = new Map();
 const pendingRequests = new Map();
 const downloadById = new Map();
 const folderDownloadById = new Map();
+const folderDownloadPumpOperations = new Map();
 const cleanupTabs = new Set();
 const expectedDetachTabs = new Set();
 const expectedDetachTimers = new Map();
@@ -59,6 +63,7 @@ const lastDetachAt = new Map();
 const folderScanRuntime = new Map();
 const expectedFolderNavigations = new Map();
 const FOLDER_CANDIDATE_TIMEOUT_MS = 20_000;
+const MAX_ACTIVE_FOLDER_DOWNLOADS = 3;
 const ACTIVE_FOLDER_SCAN_STATUSES = new Set([
     FOLDER_SCAN_STATUSES.DISCOVERING,
     FOLDER_SCAN_STATUSES.COLLECTING,
@@ -607,14 +612,12 @@ function folderDownloadOptions(scan, item, url, fallback = "file") {
 }
 
 async function startFolderVideoDownload(tabId, scanId, item) {
-    const preparing = await updateFolderDownloadItemState(tabId, scanId, item.key, {
-        status: FOLDER_DOWNLOAD_STATUSES.PREPARING,
-        error: null,
-    });
-    if (!preparing) return { success: false, cancelled: true };
-
     const scan = tabState.getFolderScan(tabId);
     if (scan.id !== scanId || scan.status !== FOLDER_SCAN_STATUSES.DOWNLOADING) return { success: false, cancelled: true };
+    const currentItem = scan.downloadItems.find((downloadItem) => downloadItem.key === item.key);
+    if (!currentItem || currentItem.status !== FOLDER_DOWNLOAD_STATUSES.PREPARING) {
+        return { success: false, cancelled: true };
+    }
     const video = tabState.findVideo(tabId, item.videoId);
     const format = video ? selectBestProgressiveFormat(video.formats) : null;
     if (!format) {
@@ -632,11 +635,20 @@ async function startFolderVideoDownload(tabId, scanId, item) {
         );
         if (!Number.isInteger(downloadId)) throw new Error("Chrome did not return a download ID.");
         folderDownloadById.set(downloadId, { tabId, scanId, itemKey: item.key });
+        const currentScan = tabState.getFolderScan(tabId);
+        const currentDownloadItem = currentScan.downloadItems.find((downloadItem) => downloadItem.key === item.key);
+        const terminal = [
+            FOLDER_DOWNLOAD_STATUSES.COMPLETE,
+            FOLDER_DOWNLOAD_STATUSES.FAILED,
+            FOLDER_DOWNLOAD_STATUSES.CANCELLED,
+        ].includes(currentDownloadItem?.status);
+        if (currentDownloadItem?.status === FOLDER_DOWNLOAD_STATUSES.CANCELLED) {
+            await chromeCall(chrome.downloads.cancel.bind(chrome.downloads), downloadId).catch(() => undefined);
+        }
         await updateFolderDownloadItemState(tabId, scanId, item.key, {
-            status: FOLDER_DOWNLOAD_STATUSES.DOWNLOADING,
             downloadId,
             totalBytes: format.contentLength,
-            error: null,
+            ...(terminal ? {} : { status: FOLDER_DOWNLOAD_STATUSES.DOWNLOADING, error: null }),
         });
         return { success: true, downloadId };
     } catch (error) {
@@ -649,15 +661,17 @@ async function startFolderVideoDownload(tabId, scanId, item) {
 }
 
 async function startFolderRegularFileDownload(tabId, scanId, item) {
-    const preparing = await updateFolderDownloadItemState(tabId, scanId, item.key, {
-        status: FOLDER_DOWNLOAD_STATUSES.PREPARING,
-        error: null,
-    });
-    if (!preparing) return { success: false, cancelled: true };
+    const initialScan = tabState.getFolderScan(tabId);
+    if (initialScan.id !== scanId || initialScan.status !== FOLDER_SCAN_STATUSES.DOWNLOADING) {
+        return { success: false, cancelled: true };
+    }
+    const currentItem = initialScan.downloadItems.find((downloadItem) => downloadItem.key === item.key);
+    if (!currentItem || currentItem.status !== FOLDER_DOWNLOAD_STATUSES.PREPARING) {
+        return { success: false, cancelled: true };
+    }
 
     try {
-        const scan = tabState.getFolderScan(tabId);
-        const prepared = await prepareRegularDriveFileDownload(tabId, item.fileId, scan.authuser);
+        const prepared = await prepareRegularDriveFileDownload(tabId, item.fileId, initialScan.authuser);
         const currentScan = tabState.getFolderScan(tabId);
         if (currentScan.id !== scanId || currentScan.status !== FOLDER_SCAN_STATUSES.DOWNLOADING) return { success: false, cancelled: true };
         const downloadId = await chromeCall(
@@ -666,12 +680,21 @@ async function startFolderRegularFileDownload(tabId, scanId, item) {
         );
         if (!Number.isInteger(downloadId)) throw new Error("Chrome did not return a download ID.");
         folderDownloadById.set(downloadId, { tabId, scanId, itemKey: item.key });
+        const latestScan = tabState.getFolderScan(tabId);
+        const currentDownloadItem = latestScan.downloadItems.find((downloadItem) => downloadItem.key === item.key);
+        const terminal = [
+            FOLDER_DOWNLOAD_STATUSES.COMPLETE,
+            FOLDER_DOWNLOAD_STATUSES.FAILED,
+            FOLDER_DOWNLOAD_STATUSES.CANCELLED,
+        ].includes(currentDownloadItem?.status);
+        if (currentDownloadItem?.status === FOLDER_DOWNLOAD_STATUSES.CANCELLED) {
+            await chromeCall(chrome.downloads.cancel.bind(chrome.downloads), downloadId).catch(() => undefined);
+        }
         await updateFolderDownloadItemState(tabId, scanId, item.key, {
-            status: FOLDER_DOWNLOAD_STATUSES.DOWNLOADING,
             downloadId,
             name: prepared.fileName ?? item.name,
             totalBytes: prepared.sizeBytes,
-            error: null,
+            ...(terminal ? {} : { status: FOLDER_DOWNLOAD_STATUSES.DOWNLOADING, error: null }),
         });
         return { success: true, downloadId };
     } catch (error) {
@@ -717,15 +740,47 @@ async function maybeCompleteFolderDownload(tabId, scanId) {
     return true;
 }
 
-async function startPendingFolderDownloads(tabId, scanId) {
-    const scan = tabState.getFolderScan(tabId);
-    if (scan.id !== scanId || scan.status !== FOLDER_SCAN_STATUSES.DOWNLOADING) return;
-    const videos = scan.downloadItems.filter((item) => item.kind === "video"
-        && item.status === FOLDER_DOWNLOAD_STATUSES.PENDING);
-    const regularFiles = scan.downloadItems.filter((item) => item.kind === "file"
-        && item.status === FOLDER_DOWNLOAD_STATUSES.PENDING);
-    await runWithConcurrency(videos.map((item) => () => startFolderVideoDownload(tabId, scanId, item)), 3);
-    await runWithConcurrency(regularFiles.map((item) => () => startFolderRegularFileDownload(tabId, scanId, item)), 3);
+async function pumpFolderDownloadQueueInternal(tabId, scanId) {
+    while (true) {
+        const scan = tabState.getFolderScan(tabId);
+        if (scan.id !== scanId || scan.status !== FOLDER_SCAN_STATUSES.DOWNLOADING) return;
+
+        const batch = getFolderDownloadQueueBatch(scan.downloadItems, MAX_ACTIVE_FOLDER_DOWNLOADS);
+        if (batch.items.length === 0) return;
+
+        const selectedKeys = new Set(batch.items.map((item) => item.key));
+        tabState.updateFolderScan(tabId, {
+            downloadItems: scan.downloadItems.map((item) => selectedKeys.has(item.key)
+                ? { ...item, status: FOLDER_DOWNLOAD_STATUSES.PREPARING, error: null }
+                : item),
+        });
+        await persistAndNotifyFolderScan(tabId);
+
+        debugLog("Folder download queue", {
+            tabId,
+            scanId,
+            activeFolderDownloads: batch.activeCount,
+            availableSlots: batch.availableSlots,
+            nextItems: batch.items.map((item) => item.key),
+        });
+
+        await Promise.all(batch.items.map((item) => item.kind === "video"
+            ? startFolderVideoDownload(tabId, scanId, item)
+            : startFolderRegularFileDownload(tabId, scanId, item)));
+    }
+}
+
+function pumpFolderDownloadQueue(tabId, scanId) {
+    const key = `${tabId}:${scanId}`;
+    const previous = folderDownloadPumpOperations.get(key) ?? Promise.resolve();
+    const current = previous
+        .catch(() => undefined)
+        .then(() => pumpFolderDownloadQueueInternal(tabId, scanId))
+        .finally(() => {
+            if (folderDownloadPumpOperations.get(key) === current) folderDownloadPumpOperations.delete(key);
+        });
+    folderDownloadPumpOperations.set(key, current);
+    return current;
 }
 
 async function startFolderDownloadPhase(tabId, scanId) {
@@ -754,7 +809,7 @@ async function startFolderDownloadPhase(tabId, scanId) {
     });
     await persistAndNotifyFolderScan(tabId);
 
-    await startPendingFolderDownloads(tabId, scanId);
+    await pumpFolderDownloadQueue(tabId, scanId);
     await maybeCompleteFolderDownload(tabId, scanId);
     return true;
 }
@@ -1183,6 +1238,7 @@ async function handleFolderDownloadChange(downloadId, delta, association) {
     await updateFolderDownloadItemState(association.tabId, association.scanId, association.itemKey, changes);
     if ([FOLDER_DOWNLOAD_STATUSES.COMPLETE, FOLDER_DOWNLOAD_STATUSES.FAILED].includes(changes.status)) {
         folderDownloadById.delete(downloadId);
+        await pumpFolderDownloadQueue(association.tabId, association.scanId);
         await maybeCompleteFolderDownload(association.tabId, association.scanId);
     }
 }
@@ -1247,6 +1303,7 @@ async function startFolderScan(tabId) {
         advancePromise: null,
     });
     tabState.enableTab(tabId);
+    const folderNameFromTitle = extractDriveFolderNameFromTitle(tab.title);
     tabState.updateFolderScan(tabId, {
         ...createFolderScanState({ now: Date.now() }),
         id: scanId,
@@ -1255,6 +1312,10 @@ async function startFolderScan(tabId) {
         folderUrl: tab.url,
         returnUrl: tab.url,
         authuser: extractDriveAuthUser(tab.url),
+        folderName: folderNameFromTitle,
+        downloadDirectory: folderNameFromTitle
+            ? sanitizePathSegment(folderNameFromTitle, "Google Drive Folder")
+            : null,
         startedAt: Date.now(),
         updatedAt: Date.now(),
     });
@@ -1305,9 +1366,7 @@ async function handleDiscoveryComplete(tabId, message) {
     const candidates = dedupeFolderCandidates(message.candidates).map((candidate) => normalizeFolderCandidate(candidate)).filter(Boolean);
     const regularFiles = dedupeRegularDriveFiles(message.regularFiles);
     const unsupportedFiles = dedupeUnsupportedDriveFiles(message.unsupportedFiles);
-    const folderName = typeof message.folderName === "string" && message.folderName.trim()
-        ? message.folderName.trim()
-        : "Google Drive Folder";
+    const folderName = resolveDriveFolderName(scan.folderName, message.folderName);
     const discoveredCount = Number.isInteger(message.discoveredCount) && message.discoveredCount >= 0
         ? message.discoveredCount
         : candidates.length + regularFiles.length + unsupportedFiles.length;
@@ -1428,7 +1487,7 @@ async function recoverFolderDownloads(state, tab) {
             });
             await persistAndNotifyFolderScan(state.tabId);
         }
-        await startPendingFolderDownloads(state.tabId, scan.id);
+        await pumpFolderDownloadQueue(state.tabId, scan.id);
     }
     await maybeCompleteFolderDownload(state.tabId, scan.id);
     return true;

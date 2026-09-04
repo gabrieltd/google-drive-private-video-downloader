@@ -11,6 +11,7 @@ import {
     dedupeUnsupportedDriveFiles,
     dedupeFolderCandidates,
     folderDownloadProgress,
+    getFolderDownloadQueueBatch,
     folderScanProgress,
     getNextPendingCandidate,
     isLikelyVideoFilename,
@@ -185,6 +186,67 @@ test("calculates folder download progress from persisted item statuses", () => {
         cancelledCount: 0,
         skippedCount: 1,
     });
+});
+
+test("selects at most three active folder downloads and prioritizes videos", () => {
+    const items = [
+        { key: "video:A", kind: "video", status: FOLDER_DOWNLOAD_STATUSES.PENDING, downloadId: null },
+        { key: "file:B", kind: "file", status: FOLDER_DOWNLOAD_STATUSES.PENDING, downloadId: null },
+        { key: "video:C", kind: "video", status: FOLDER_DOWNLOAD_STATUSES.PENDING, downloadId: null },
+        { key: "file:D", kind: "file", status: FOLDER_DOWNLOAD_STATUSES.PENDING, downloadId: null },
+        { key: "video:E", kind: "video", status: FOLDER_DOWNLOAD_STATUSES.PENDING, downloadId: null },
+        { key: "file:F", kind: "file", status: FOLDER_DOWNLOAD_STATUSES.PENDING, downloadId: null },
+    ];
+    const batch = getFolderDownloadQueueBatch(items, 3);
+    assert.equal(batch.activeCount, 0);
+    assert.equal(batch.availableSlots, 3);
+    assert.deepEqual(batch.items.map((item) => item.key), ["video:A", "video:C", "video:E"]);
+
+    const reservedItems = items.map((item) => batch.items.some((selected) => selected.key === item.key)
+        ? { ...item, status: FOLDER_DOWNLOAD_STATUSES.PREPARING }
+        : item);
+    const secondBatch = getFolderDownloadQueueBatch(reservedItems, 3);
+    assert.equal(secondBatch.activeCount, 3);
+    assert.deepEqual(secondBatch.items, []);
+});
+
+test("completing or failing a folder download releases one queue slot", () => {
+    const baseItems = [
+        { key: "video:A", kind: "video", status: FOLDER_DOWNLOAD_STATUSES.DOWNLOADING, downloadId: 1 },
+        { key: "video:B", kind: "video", status: FOLDER_DOWNLOAD_STATUSES.DOWNLOADING, downloadId: 2 },
+        { key: "video:C", kind: "video", status: FOLDER_DOWNLOAD_STATUSES.DOWNLOADING, downloadId: 3 },
+        { key: "video:D", kind: "video", status: FOLDER_DOWNLOAD_STATUSES.PENDING, downloadId: null },
+    ];
+    assert.deepEqual(getFolderDownloadQueueBatch(baseItems, 3).items, []);
+
+    const completedItems = baseItems.map((item) => item.key === "video:B"
+        ? { ...item, status: FOLDER_DOWNLOAD_STATUSES.COMPLETE }
+        : item);
+    assert.deepEqual(getFolderDownloadQueueBatch(completedItems, 3).items.map((item) => item.key), ["video:D"]);
+
+    const failedItems = baseItems.map((item) => item.key === "video:B"
+        ? { ...item, status: FOLDER_DOWNLOAD_STATUSES.FAILED }
+        : item);
+    assert.deepEqual(getFolderDownloadQueueBatch(failedItems, 3).items.map((item) => item.key), ["video:D"]);
+});
+
+test("starts regular files when no pending video remains", () => {
+    const batch = getFolderDownloadQueueBatch([
+        { key: "video:A", kind: "video", status: FOLDER_DOWNLOAD_STATUSES.DOWNLOADING, downloadId: 1 },
+        { key: "file:B", kind: "file", status: FOLDER_DOWNLOAD_STATUSES.PENDING, downloadId: null },
+        { key: "file:C", kind: "file", status: FOLDER_DOWNLOAD_STATUSES.PENDING, downloadId: null },
+    ], 3);
+    assert.equal(batch.activeCount, 1);
+    assert.deepEqual(batch.items.map((item) => item.key), ["file:B", "file:C"]);
+});
+
+test("does not queue skipped items or pending items with an existing download ID", () => {
+    const batch = getFolderDownloadQueueBatch([
+        { key: "unsupported:A", kind: "unsupported", status: FOLDER_DOWNLOAD_STATUSES.SKIPPED, downloadId: null },
+        { key: "file:B", kind: "file", status: FOLDER_DOWNLOAD_STATUSES.PENDING, downloadId: 22 },
+        { key: "file:C", kind: "file", status: FOLDER_DOWNLOAD_STATUSES.PENDING, downloadId: null },
+    ], 3);
+    assert.deepEqual(batch.items.map((item) => item.key), ["file:C"]);
 });
 
 test("normalizes the new folder scan state and preserves the no-video transition", () => {

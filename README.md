@@ -12,6 +12,7 @@ A small Chromium Manifest V3 extension that downloads progressive video streams 
 - Deduplicates repeated Drive responses and merges newly discovered formats.
 - Tracks download, completion, and interruption states.
 - Limits `Download selected` to three download starts at a time.
+- Limits Folder Scan to three active Chrome downloads, including regular-file preparation.
 - Scans videos and regular files directly contained in the currently open Drive folder.
 - Automatically downloads every supported folder item into `<Chrome Downloads>/<Drive folder name>/` when the scan finishes.
 - Marks Google-native Docs, Sheets, Slides, and similar items as unsupported instead of attempting an unvalidated export.
@@ -69,7 +70,7 @@ chrome.downloads.download()
 
 The background service worker attaches `chrome.debugger` only to enabled `drive.google.com` tabs. It observes a small allowlist of known Drive playback hosts, reads a response body only long enough to parse it, then discards the raw body. The popup receives domain data (`videos`, `download`, and tab state), never raw CDP requests.
 
-During a folder scan, the folder scanner reports direct file metadata to the service worker. Videos use the existing playback collector. Regular files use an authenticated `POST` to Drive's current `/uc` preparation endpoint from the Drive tab's `MAIN` world, validate the returned download URL, and immediately pass it to `chrome.downloads.download()`. Download URLs are never stored in the persisted folder state.
+During a folder scan, the folder scanner reports direct file metadata to the service worker. Videos use the existing playback collector. Regular files use an authenticated `POST` to Drive's current `/uc` preparation endpoint from the Drive tab's `MAIN` world, validate the returned download URL, and immediately pass it to `chrome.downloads.download()`. A persisted queue keeps at most three folder transfers in `PREPARING` or `DOWNLOADING`, prioritizes pending videos, and starts the next item when a transfer completes or fails. Download URLs are never stored in the persisted folder state.
 
 ## Permissions
 

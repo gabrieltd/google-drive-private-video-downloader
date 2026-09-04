@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Google Drive - Private Video Downloader",
-  "version": "1.3.0",
+  "version": "1.3.1",
   "description": "Download progressive video streams and supported files from your authenticated Google Drive session.",
   "icons": {
     "16": "assets/icon.png",

@@ -4,11 +4,13 @@ import {
     extractDriveFileIdFromUrl,
     extractDriveFolderId,
     extractDriveAuthUser,
+    extractDriveFolderNameFromTitle,
     extractDrivePlaybackFileId,
     isGoogleDriveUrl,
     isGoogleDriveFolderUrl,
     isPotentialDrivePlaybackRequest,
     shouldAttachDebugger,
+    resolveDriveFolderName,
 } from "../lib/url-utils.js";
 
 test("validates Drive URLs without substring false positives", () => {
@@ -46,6 +48,32 @@ test("extracts the Drive authuser from the explicit query before the path", () =
     assert.equal(extractDriveAuthUser("https://drive.google.com/drive/u/1/folders/ABC?authuser=2"), "2");
     assert.equal(extractDriveAuthUser("https://drive.google.com/drive/folders/ABC"), "0");
     assert.equal(extractDriveAuthUser("https://example.test/drive/u/1/folders/ABC"), "0");
+});
+
+test("extracts a specific folder name from the original Drive tab title", () => {
+    assert.equal(
+        extractDriveFolderNameFromTitle("25. CALENTAR CUENTA FACEBOOK PARA EVITAR BANEOS - Google Drive"),
+        "25. CALENTAR CUENTA FACEBOOK PARA EVITAR BANEOS",
+    );
+    assert.equal(
+        extractDriveFolderNameFromTitle("  Course Name   - Google Drive  "),
+        "Course Name",
+    );
+    assert.equal(
+        extractDriveFolderNameFromTitle("Google Drive Marketing Course - Google Drive"),
+        "Google Drive Marketing Course",
+    );
+});
+
+test("rejects generic Drive titles and preserves a strong folder-name precedence", () => {
+    assert.equal(extractDriveFolderNameFromTitle("Google Drive"), null);
+    assert.equal(extractDriveFolderNameFromTitle("My Drive - Google Drive"), null);
+    assert.equal(
+        resolveDriveFolderName("25. CALENTAR CUENTA FACEBOOK", "Signature pending"),
+        "25. CALENTAR CUENTA FACEBOOK",
+    );
+    assert.equal(resolveDriveFolderName("Google Drive", "Meta Ads"), "Meta Ads");
+    assert.equal(resolveDriveFolderName(null, null), "Google Drive Folder");
 });
 
 test("extracts Drive file and playback IDs only from supported URL shapes", () => {
